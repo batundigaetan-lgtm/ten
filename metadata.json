@@ -1,0 +1,6 @@
+{
+  "name": "RentTech Hub",
+  "description": "Plateforme haut de gamme d'investissement et de location de matériel informatique (iPad, ordinateurs) avec système de parrainage à 20% et gestion des transactions Airtel Money.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
