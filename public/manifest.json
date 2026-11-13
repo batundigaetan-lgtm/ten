@@ -1,0 +1,19 @@
+{
+  "short_name": "RentTech Hub",
+  "name": "RentTech Hub - Location & Investissement High-Tech RDC",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "type": "image/svg+xml",
+      "sizes": "512x512 192x192 48x48",
+      "purpose": "any maskable"
+    }
+  ],
+  "start_url": "/",
+  "background_color": "#0b111e",
+  "theme_color": "#0b111e",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "scope": "/",
+  "description": "Plateforme n°1 de location technologique et investissement à haut rendement en République Démocratique du Congo."
+}
