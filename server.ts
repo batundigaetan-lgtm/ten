@@ -7,7 +7,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT ?? 3000);
 
 // Capture du corps brut (raw body) pour la vérification cryptographique HMAC-SHA256 du webhook
 app.use(express.json());
