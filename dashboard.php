@@ -5,55 +5,31 @@
  */
 
 require_once 'config.php';
+require_once 'maishapay.php';
 check_login();
 
 $user_id = $_SESSION['user_id'];
 $message = '';
 $error = '';
 
-// Traitement de l'envoi d'une preuve de dépôt (Recharge Airtel Money)
+// Traitement du dépôt automatique par Mobile Money (MaishaPay API - Push USSD/STK)
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'deposit') {
-    $amount = floatval($_POST['amount']);
-    $level_name = sanitize($_POST['level_name']);
+    verify_csrf_token($_POST['csrf_token'] ?? '');
+    $amount = floatval($_POST['amount'] ?? 0);
+    $level_name = sanitize($_POST['level_name'] ?? 'Recharge Automatique');
+    $phone = sanitize($_POST['phone'] ?? '');
+    $operator = sanitize($_POST['operator'] ?? '');
 
     if ($amount <= 0) {
         $error = "Veuillez entrer un montant valide.";
-    } elseif (!isset($_FILES['proof_image']) || $_FILES['proof_image']['error'] !== UPLOAD_ERR_OK) {
-        $error = "Veuillez téléverser une capture d'écran valide comme preuve de paiement.";
+    } elseif (empty($phone)) {
+        $error = "Veuillez spécifier votre numéro Mobile Money pour recevoir le push de validation.";
     } else {
-        $fileTmpPath = $_FILES['proof_image']['tmp_name'];
-        $fileName = $_FILES['proof_image']['name'];
-        $fileSize = $_FILES['proof_image']['size'];
-        $fileType = $_FILES['proof_image']['type'];
-
-        $fileNameCmps = explode(".", $fileName);
-        $fileExtension = strtolower(end($fileNameCmps));
-
-        $allowedExtensions = ['jpg', 'jpeg', 'png'];
-
-        if (!in_array($fileExtension, $allowedExtensions)) {
-            $error = "Format de fichier non autorisé. Seules les images JPG, JPEG et PNG sont acceptées.";
+        $res = maishapay_initiate_deposit($pdo, $user_id, $amount, $phone, $operator, $level_name);
+        if ($res['ok']) {
+            $message = $res['message'];
         } else {
-            // Sécurité Anti-Fraude & Injection : Nom unique sécurisé
-            $newFileName = bin2hex(random_bytes(16)) . '_' . time() . '.' . $fileExtension;
-            $uploadFileDir = './uploads/';
-
-            if (!is_dir($uploadFileDir)) {
-                mkdir($uploadFileDir, 0755, true);
-            }
-
-            $dest_path = $uploadFileDir . $newFileName;
-
-            if (move_uploaded_file($fileTmpPath, $dest_path)) {
-                $stmt = $pdo->prepare("INSERT INTO deposits (user_id, amount, level_name, proof_image, status) VALUES (?, ?, ?, ?, 'en_attente')");
-                if ($stmt->execute([$user_id, $amount, $level_name, $newFileName])) {
-                    $message = "Votre demande de recharge de " . number_format($amount, 0, ',', ' ') . " FC a été envoyée avec succès ! L'administrateur va vérifier votre preuve de paiement.";
-                } else {
-                    $error = "Erreur lors de l'enregistrement de la recharge.";
-                }
-            } else {
-                $error = "Une erreur est survenue lors du téléversement de la preuve de paiement.";
-            }
+            $error = $res['message'];
         }
     }
 }
@@ -274,24 +250,33 @@ $levels = get_investment_levels();
         <div id="copySuccess" class="text-success small mt-2 fw-bold" style="display: none;"><i class="bi bi-check-all me-1"></i> Lien copié dans le presse-papier !</div>
     </div>
 
-    <!-- CONSIGNES DE RECHARGE AIRTEL MONEY -->
+    <!-- CONSIGNES DE RECHARGE MOBILE MONEY AUTOMATIQUE MAISHAPAY -->
     <div class="card card-custom p-4 mb-4 border-warning">
         <div class="d-flex align-items-center mb-3">
             <i class="bi bi-phone-vibrate text-gold fs-1 me-3"></i>
             <div>
-                <h5 class="text-gold fw-bold mb-1">Instruction de Paiement Mobile Airtel Money</h5>
-                <p class="text-muted small mb-0">Effectuez votre transfert manuel avant d'envoyer votre capture d'écran.</p>
+                <h5 class="text-gold fw-bold mb-1">Recharge Automatique & Instantanée via MaishaPay</h5>
+                <p class="text-muted small mb-0">Plus besoin de transfert manuel ni de capture d'écran ! Indiquez votre numéro et validez le push directement sur votre téléphone avec votre code secret Mobile Money.</p>
             </div>
         </div>
         <div class="bg-dark p-3 rounded-3 border border-secondary">
-            <div class="row align-items-center text-center text-md-start">
-                <div class="col-md-6 mb-2 mb-md-0">
-                    <span class="text-muted small">Numéro Officiel Airtel Money :</span>
-                    <h4 class="text-white fw-bold mb-0"><?= AIRTEL_OFFICIAL_NUMBER ?></h4>
+            <div class="row align-items-center text-center text-md-start g-3">
+                <div class="col-md-5">
+                    <span class="text-muted small">Réseaux Supportés en RDC :</span>
+                    <div class="text-white fw-bold d-flex flex-wrap align-items-center gap-2 mt-1">
+                        <span class="badge bg-danger"><i class="bi bi-broadcast me-1"></i> Airtel Money</span>
+                        <span class="badge bg-primary"><i class="bi bi-phone me-1"></i> Vodacom M-Pesa</span>
+                        <span class="badge bg-warning text-dark"><i class="bi bi-wallet2 me-1"></i> Orange Money</span>
+                    </div>
                 </div>
-                <div class="col-md-6">
-                    <span class="text-muted small">Nom du Destinataire Obligatoire :</span>
-                    <h4 class="text-gold fw-bold mb-0"><?= AIRTEL_OFFICIAL_NAME ?></h4>
+                <div class="col-md-4">
+                    <span class="text-muted small">Délai d'exécution :</span>
+                    <h5 class="text-success fw-bold mb-0"><i class="bi bi-lightning-charge-fill me-1"></i> Push Instantané (5 - 30s)</h5>
+                </div>
+                <div class="col-md-3 text-md-end">
+                    <button class="btn btn-gold fw-bold w-100 py-2" data-bs-toggle="modal" data-bs-target="#depositModal">
+                        <i class="bi bi-phone-vibrate me-1"></i> Recharger
+                    </button>
                 </div>
             </div>
         </div>
@@ -340,23 +325,39 @@ $levels = get_investment_levels();
                             <tr>
                                 <th>Pack</th>
                                 <th>Montant</th>
+                                <th>Opérateur</th>
+                                <th>Référence</th>
                                 <th>Statut</th>
                                 <th>Date</th>
                             </tr>
                         </thead>
                         <tbody>
                             <?php if (empty($my_deposits)): ?>
-                                <tr><td colspan="4" class="text-center text-muted">Aun dépôt effectué pour le moment.</td></tr>
+                                <tr><td colspan="6" class="text-center text-muted">Aucun dépôt effectué pour le moment.</td></tr>
                             <?php else: ?>
                                 <?php foreach ($my_deposits as $d): ?>
                                     <tr>
-                                        <td><?= htmlspecialchars($d['level_name']) ?></td>
+                                        <td><?= htmlspecialchars($d['level_name'] ?? 'Recharge') ?></td>
                                         <td class="fw-bold text-gold"><?= number_format($d['amount'], 0, ',', ' ') ?> FC</td>
                                         <td>
+                                            <?php 
+                                            $op = strtoupper($d['operator'] ?? 'AIRTEL');
+                                            if ($op === 'AIRTEL'): ?>
+                                                <span class="badge bg-danger">Airtel</span>
+                                            <?php elseif ($op === 'MPESA'): ?>
+                                                <span class="badge bg-primary">M-Pesa</span>
+                                            <?php elseif ($op === 'ORANGE'): ?>
+                                                <span class="badge bg-warning text-dark">Orange</span>
+                                            <?php else: ?>
+                                                <span class="badge bg-secondary"><?= htmlspecialchars($op) ?></span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td><code class="text-info small"><?= htmlspecialchars($d['transaction_ref'] ?: 'DEP-' . $d['id']) ?></code></td>
+                                        <td>
                                             <?php if ($d['status'] === 'en_attente'): ?>
-                                                <span class="badge bg-warning text-dark"><i class="bi bi-clock me-1"></i> En attente</span>
+                                                <span class="badge bg-warning text-dark"><i class="bi bi-clock me-1"></i> En attente PIN</span>
                                             <?php elseif ($d['status'] === 'approuve'): ?>
-                                                <span class="badge bg-success"><i class="bi bi-check-circle me-1"></i> Approuvé</span>
+                                                <span class="badge bg-success"><i class="bi bi-check-circle me-1"></i> Validé</span>
                                             <?php else: ?>
                                                 <span class="badge bg-danger"><i class="bi bi-x-circle me-1"></i> Rejeté</span>
                                             <?php endif; ?>
@@ -411,34 +412,74 @@ $levels = get_investment_levels();
 
 </div>
 
-<!-- MODAL DEPOT / RECHARGE -->
+<!-- MODAL DEPOT / RECHARGE AUTOMATIQUE MAISHAPAY -->
 <div class="modal fade" id="depositModal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content card-custom text-white">
             <div class="modal-header border-secondary">
-                <h5 class="modal-title text-gold fw-bold"><i class="bi bi-wallet-fill me-2"></i> Soumettre une Preuve de Dépôt</h5>
+                <h5 class="modal-title text-gold fw-bold"><i class="bi bi-phone-vibrate me-2"></i> Recharge Mobile Money Instantanée</h5>
                 <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
-            <form action="dashboard.php" method="POST" enctype="multipart/form-data">
+            
+            <form id="depositForm" action="dashboard.php" method="POST">
                 <input type="hidden" name="action" value="deposit">
+                <input type="hidden" name="csrf_token" value="<?= generate_csrf_token() ?>">
+                
                 <div class="modal-body">
-                    <div class="mb-3">
-                        <label class="form-label">Nom du Pack / Description</label>
-                        <input type="text" id="modalLevelName" name="level_name" class="form-control" value="Recharge Manuelle" required>
+                    <!-- Statut interactif du Push USSD / Mobile Money -->
+                    <div id="pushStatusBox" class="p-3 mb-3 rounded-3 border bg-dark" style="display: none;">
+                        <div class="d-flex align-items-center gap-3">
+                            <div class="spinner-border text-warning spinner-border-sm" role="status" id="pushSpinner"></div>
+                            <div>
+                                <h6 class="fw-bold mb-1 text-white" id="pushStatusTitle">Demande en cours...</h6>
+                                <p class="small mb-0 text-muted" id="pushStatusDesc">Connexion sécurisée à MaishaPay...</p>
+                            </div>
+                        </div>
                     </div>
+
                     <div class="mb-3">
-                        <label class="form-label">Montant envoyé (FC)</label>
-                        <input type="number" id="modalAmount" name="amount" class="form-control" placeholder="ex: 15000" min="1000" required>
+                        <label class="form-label small text-muted">Nom du Pack / Destination</label>
+                        <input type="text" id="modalLevelName" name="level_name" class="form-control" value="Recharge Automatique" required>
                     </div>
+
                     <div class="mb-3">
-                        <label class="form-label">Capture d'Écran de Preuve de Paiement (JPG, PNG)</label>
-                        <input type="file" name="proof_image" class="form-control" accept="image/png, image/jpeg, image/jpg" required>
-                        <small class="text-muted">Assurez-vous que le numéro de transaction et le nom KAMBALE soient visibles.</small>
+                        <label class="form-label small text-muted">Réseau Mobile Money</label>
+                        <select id="modalOperator" name="operator" class="form-select bg-dark text-white border-secondary">
+                            <option value="AIRTEL">Airtel Money (097, 098, 099)</option>
+                            <option value="MPESA">Vodacom M-Pesa (081, 082, 083)</option>
+                            <option value="ORANGE">Orange Money (084, 085, 089, 080)</option>
+                            <option value="AFRICELL">Africell Money (090, 091)</option>
+                        </select>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label small text-muted">Numéro de téléphone Mobile Money</label>
+                        <div class="input-group">
+                            <span class="input-group-text bg-dark text-gold border-secondary"><i class="bi bi-telephone-fill"></i></span>
+                            <input type="tel" id="modalPhone" name="phone" class="form-control" placeholder="ex: 0992611845" value="<?= htmlspecialchars($user['phone'] ?? '') ?>" required>
+                        </div>
+                        <small class="text-muted" id="phoneHint">C'est sur ce numéro que vous recevrez la notification push pour taper votre code PIN.</small>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label small text-muted">Montant à recharger (FC)</label>
+                        <div class="input-group">
+                            <span class="input-group-text bg-dark text-gold border-secondary">FC</span>
+                            <input type="number" id="modalAmount" name="amount" class="form-control fw-bold" placeholder="ex: 15000" min="5000" required>
+                        </div>
+                    </div>
+
+                    <div class="p-3 bg-dark rounded-3 border border-secondary text-muted small">
+                        <i class="bi bi-shield-lock-fill text-gold me-1"></i>
+                        <strong>Paiement 100% Automatique :</strong> Plus besoin d'envoyer de capture d'écran ! Dès que vous lancez la demande, un prompt apparaît sur votre écran de téléphone pour entrer votre code secret Mobile Money.
                     </div>
                 </div>
+
                 <div class="modal-footer border-secondary">
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Annuler</button>
-                    <button type="submit" class="btn btn-gold"><i class="bi bg-check-lg me-1"></i> Confirmer l'Envoi</button>
+                    <button type="submit" id="btnSubmitDeposit" class="btn btn-gold fw-bold">
+                        <i class="bi bi-phone-vibrate me-1"></i> Lancer la Recharge
+                    </button>
                 </div>
             </form>
         </div>
@@ -491,12 +532,12 @@ $levels = get_investment_levels();
     </a>
 </div>
 
-<script href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
 <script>
     function copyAffiliateLink() {
         var copyText = document.getElementById("affiliateLink");
         copyText.select();
-        copyText.setSelectionRange(0, 99999); // Mobile compatibility
+        copyText.setSelectionRange(0, 99999);
         navigator.clipboard.writeText(copyText.value);
 
         var successMsg = document.getElementById("copySuccess");
@@ -509,6 +550,135 @@ $levels = get_investment_levels();
     function selectLevel(name, price) {
         document.getElementById('modalLevelName').value = name;
         document.getElementById('modalAmount').value = price;
+    }
+
+    // Auto-détection dynamique de l'opérateur selon le numéro saisi
+    const phoneInput = document.getElementById('modalPhone');
+    const operatorSelect = document.getElementById('modalOperator');
+    if (phoneInput && operatorSelect) {
+        phoneInput.addEventListener('input', function() {
+            const val = this.value.replace(/[^0-9]/g, '');
+            let prefix = '';
+            if (val.startsWith('243') && val.length >= 5) {
+                prefix = '0' + val.substring(3, 5);
+            } else if (val.startsWith('0') && val.length >= 3) {
+                prefix = val.substring(0, 3);
+            } else if (val.length >= 2) {
+                prefix = '0' + val.substring(0, 2);
+            }
+
+            if (['097', '098', '099'].includes(prefix)) {
+                operatorSelect.value = 'AIRTEL';
+            } else if (['081', '082', '083'].includes(prefix)) {
+                operatorSelect.value = 'MPESA';
+            } else if (['084', '085', '089', '080'].includes(prefix)) {
+                operatorSelect.value = 'ORANGE';
+            } else if (['090', '091'].includes(prefix)) {
+                operatorSelect.value = 'AFRICELL';
+            }
+        });
+    }
+
+    // Gestion asynchrone du Push Mobile Money via AJAX & Polling en direct
+    const depositForm = document.getElementById('depositForm');
+    if (depositForm) {
+        depositForm.addEventListener('submit', function(e) {
+            e.preventDefault();
+
+            const statusBox = document.getElementById('pushStatusBox');
+            const statusTitle = document.getElementById('pushStatusTitle');
+            const statusDesc = document.getElementById('pushStatusDesc');
+            const spinner = document.getElementById('pushSpinner');
+            const btnSubmit = document.getElementById('btnSubmitDeposit');
+
+            statusBox.style.display = 'block';
+            statusBox.className = 'p-3 mb-3 rounded-3 border border-warning bg-dark';
+            spinner.style.display = 'inline-block';
+            spinner.className = 'spinner-border text-warning spinner-border-sm';
+            statusTitle.className = 'fw-bold mb-1 text-warning';
+            statusTitle.textContent = "Initiation du paiement push...";
+            statusDesc.textContent = "Communication avec les serveurs de l'opérateur...";
+            btnSubmit.disabled = true;
+
+            const formData = new FormData(depositForm);
+            formData.append('action', 'initiate');
+
+            fetch('api_deposit.php', {
+                method: 'POST',
+                body: formData
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (!data.ok) {
+                    statusBox.className = 'p-3 mb-3 rounded-3 border border-danger bg-dark';
+                    spinner.style.display = 'none';
+                    statusTitle.className = 'fw-bold mb-1 text-danger';
+                    statusTitle.textContent = "Échec de l'initiation";
+                    statusDesc.textContent = data.message || "Impossible d'initier le paiement.";
+                    btnSubmit.disabled = false;
+                    return;
+                }
+
+                // Cas 1 : Succès immédiat (ex: mode Sandbox / Test)
+                if (data.etat === 'reussi') {
+                    statusBox.className = 'p-3 mb-3 rounded-3 border border-success bg-dark';
+                    spinner.style.display = 'none';
+                    statusTitle.className = 'fw-bold mb-1 text-success';
+                    statusTitle.textContent = "Simulation terminée (aucun paiement réel)";
+                    statusDesc.textContent = data.message;
+                    setTimeout(() => { window.location.reload(); }, 2000);
+                    return;
+                }
+
+                // Cas 2 : Push envoyé (Mode Production / Attente du PIN)
+                statusBox.className = 'p-3 mb-3 rounded-3 border border-info bg-dark';
+                statusTitle.className = 'fw-bold mb-1 text-info';
+                statusTitle.textContent = "📱 Push Mobile Money Envoyé !";
+                statusDesc.textContent = "Regardez votre téléphone : un message vient d'apparaître pour taper votre code PIN secret Mobile Money.";
+
+                const ref = data.reference;
+                let attempts = 0;
+                const maxAttempts = 40; // 40 * 3s = 2 minutes de surveillance
+                const interval = setInterval(() => {
+                    attempts++;
+                    fetch('api_deposit.php?action=check&reference=' + encodeURIComponent(ref))
+                    .then(r => r.json())
+                    .then(chk => {
+                        if (chk.status === 'approuve') {
+                            clearInterval(interval);
+                            statusBox.className = 'p-3 mb-3 rounded-3 border border-success bg-dark';
+                            spinner.style.display = 'none';
+                            statusTitle.className = 'fw-bold mb-1 text-success';
+                            statusTitle.textContent = "✅ Paiement Confirmé & Solde Crédité !";
+                            statusDesc.textContent = "Votre compte a été crédité avec succès ! Actualisation en cours...";
+                            setTimeout(() => { window.location.reload(); }, 1800);
+                        } else if (chk.status === 'rejete') {
+                            clearInterval(interval);
+                            statusBox.className = 'p-3 mb-3 rounded-3 border border-danger bg-dark';
+                            spinner.style.display = 'none';
+                            statusTitle.className = 'fw-bold mb-1 text-danger';
+                            statusTitle.textContent = "❌ Transaction Annulée ou Refusée";
+                            statusDesc.textContent = chk.message || "Paiement non validé par l'opérateur.";
+                            btnSubmit.disabled = false;
+                        } else if (attempts >= maxAttempts) {
+                            clearInterval(interval);
+                            statusTitle.textContent = "⏳ Délai d'attente dépassé";
+                            statusDesc.textContent = "Si vous avez validé sur votre téléphone, votre solde sera crédité automatiquement d'ici quelques instants.";
+                            btnSubmit.disabled = false;
+                        }
+                    })
+                    .catch(() => {});
+                }, 3000);
+            })
+            .catch(err => {
+                statusBox.className = 'p-3 mb-3 rounded-3 border border-danger bg-dark';
+                spinner.style.display = 'none';
+                statusTitle.className = 'fw-bold mb-1 text-danger';
+                statusTitle.textContent = "Erreur de connexion";
+                statusDesc.textContent = "Vérifiez votre connexion internet et réessayez.";
+                btnSubmit.disabled = false;
+            });
+        });
     }
 </script>
 </body>

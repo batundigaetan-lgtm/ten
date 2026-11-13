@@ -535,13 +535,41 @@ export default function App() {
     setActiveView('overview');
   };
   
-  // Formulaires & Cryptographie
+  // Formulaires & Cryptographie MaishaPay Mobile Money
   const [depositAmount, setDepositAmount] = useState<number>(15000);
+  const [depositPhone, setDepositPhone] = useState<string>('0992611845');
+  const [depositOperator, setDepositOperator] = useState<string>('AIRTEL');
+  const [depositLoading, setDepositLoading] = useState<boolean>(false);
+  const [depositPushSent, setDepositPushSent] = useState<boolean>(false);
+  const [depositTxRef, setDepositTxRef] = useState<string>('');
   const [depositSuccess, setDepositSuccess] = useState(false);
   const [depositError, setDepositError] = useState('');
   const [depositHash, setDepositHash] = useState('');
   const [depositProofPreview, setDepositProofPreview] = useState<string>('');
   const [depositProofFileName, setDepositProofFileName] = useState<string>('');
+
+  const handlePhoneChange = (val: string) => {
+    setDepositPhone(val);
+    const cleaned = val.replace(/[^0-9]/g, '');
+    let prefix = '';
+    if (cleaned.startsWith('243') && cleaned.length >= 5) {
+      prefix = '0' + cleaned.substring(3, 5);
+    } else if (cleaned.startsWith('0') && cleaned.length >= 3) {
+      prefix = cleaned.substring(0, 3);
+    } else if (cleaned.length >= 2) {
+      prefix = '0' + cleaned.substring(0, 2);
+    }
+
+    if (['097', '098', '099'].includes(prefix)) {
+      setDepositOperator('AIRTEL');
+    } else if (['081', '082', '083'].includes(prefix)) {
+      setDepositOperator('MPESA');
+    } else if (['084', '085', '089', '080'].includes(prefix)) {
+      setDepositOperator('ORANGE');
+    } else if (['090', '091'].includes(prefix)) {
+      setDepositOperator('AFRICELL');
+    }
+  };
 
   const handleProofFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
@@ -551,7 +579,6 @@ export default function App() {
       const reader = new FileReader();
       reader.onloadend = () => {
         const rawResult = reader.result as string;
-        // Optimization & compression of screenshot image to fit smoothly in localStorage without quota errors
         const img = new Image();
         img.src = rawResult;
         img.onload = () => {
@@ -598,7 +625,12 @@ export default function App() {
       setSelectedPack(pack);
       setDepositAmount(pack.price);
     }
+    if (user?.phone) {
+      handlePhoneChange(user.phone);
+    }
     setDepositSuccess(false);
+    setDepositPushSent(false);
+    setDepositLoading(false);
     setDepositProofPreview('');
     setDepositProofFileName('');
     setDepositError('');
@@ -948,8 +980,65 @@ export default function App() {
     setTimeout(() => setCopied(false), 3000);
   };
 
-  // SOUMISSION DÉPÔT & RECHARGE SECURISE
-  const handleDepositSubmit = (e: React.FormEvent) => {
+  // SOUMISSION DÉPÔT & RECHARGE MOBILE MONEY AUTOMATIQUE (MAISHAPAY API PUSH)
+  const completeDepositSuccess = (txRef: string, amount: number, op: string) => {
+    const updatedUser = {
+      ...user,
+      balance: user.balance + amount,
+      totalInvested: user.totalInvested + amount,
+      isActivated: true,
+    };
+    setUser(updatedUser);
+    try {
+      localStorage.setItem('renttech_user_v2', JSON.stringify(updatedUser));
+    } catch (err) {}
+
+    const newDeposit = {
+      id: Date.now(),
+      txId: txRef,
+      userName: user.fullName,
+      phone: depositPhone,
+      pack: selectedPack.name,
+      amount: amount,
+      operator: op,
+      date: new Date().toISOString().replace('T', ' ').substring(0, 16),
+      hash: txRef,
+      status: 'approuve',
+    };
+
+    setCompletedDeposits(prev => [newDeposit, ...prev]);
+    try {
+      const saved = localStorage.getItem('renttech_completed_deposits_v2');
+      const list = saved ? JSON.parse(saved) : [];
+      localStorage.setItem('renttech_completed_deposits_v2', JSON.stringify([newDeposit, ...list]));
+    } catch (e) {}
+
+    setUserHistory(prev => [
+      {
+        id: txRef,
+        type: 'deposit',
+        title: `Recharge Automatique (${selectedPack.name})`,
+        amount: amount,
+        status: 'approuve',
+        date: new Date().toISOString().replace('T', ' ').substring(0, 16),
+        hash: txRef,
+      },
+      ...prev,
+    ]);
+
+    setTicker(prev => [
+      { id: Date.now(), user: `${user.fullName.split(' ')[0]} K.`, action: `a rechargé via ${op}`, amount: `${amount.toLocaleString('fr-FR')} FC`, time: 'à l\'instant', type: 'deposit' },
+      ...prev,
+    ]);
+
+    setDepositHash(txRef);
+    setDepositPushSent(false);
+    setDepositLoading(false);
+    setDepositSuccess(true);
+    window.dispatchEvent(new Event('renttech_data_sync'));
+  };
+
+  const handleDepositSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setDepositError('');
 
@@ -963,56 +1052,76 @@ export default function App() {
       return;
     }
 
-    // CONTROLE STRICT : LA CAPTURE D'ÉCRAN DE PREUVE EST OBLIGATOIRE
-    if (!depositProofPreview) {
-      setDepositError("⚠️ SOUMISSION REFUSÉE : Vous n'avez pas joint la capture d'écran de votre message de confirmation Airtel Money ! Veuillez obligatoirement cliquer sur la zone ci-dessous pour sélectionner la capture de votre message avant de soumettre.");
+    if (!depositPhone || depositPhone.trim().length < 9) {
+      setDepositError('Veuillez spécifier votre numéro Mobile Money pour recevoir le push.');
       return;
     }
 
-    const txId = `TX-AIRTEL-DEP-${Math.floor(100000 + Math.random() * 900000)}`;
-    const hash = `SHA256: ${Array.from({length: 24}, () => Math.floor(Math.random()*16).toString(16)).join('')}`;
+    setDepositLoading(true);
+    setDepositPushSent(false);
 
-    const newDeposit = {
-      id: Date.now(),
-      txId,
-      userName: user.fullName,
-      phone: user.phone,
-      pack: selectedPack.name,
-      amount: depositAmount,
-      proof: depositProofPreview,
-      date: new Date().toISOString().replace('T', ' ').substring(0, 16),
-      hash
-    };
-
-    const updatedDeposits = [newDeposit, ...pendingDeposits];
-    setPendingDeposits(updatedDeposits);
     try {
-      localStorage.setItem('renttech_pending_deposits_v2', JSON.stringify(updatedDeposits));
-    } catch (err) {
-      console.error('Erreur lors de la sauvegarde du dépôt dans localStorage:', err);
+      const res = await fetch('/api/maishapay/initiate-deposit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          amount: depositAmount,
+          phone: depositPhone,
+          operator: depositOperator,
+          userId: user.id || '1',
+          customerName: user.fullName,
+          customerEmail: user.email,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setDepositError(data.error || "Impossible d'initier le paiement push Mobile Money.");
+        setDepositLoading(false);
+        return;
+      }
+
+      const txRef = data.reference || `DEP-${Date.now()}`;
+      setDepositTxRef(txRef);
+      setDepositHash(txRef);
+
+      // Si le dépôt est déjà complété (ex: Sandbox mode 0)
+      if (data.status === 'completed') {
+        completeDepositSuccess(txRef, depositAmount, data.operator || depositOperator);
+        return;
+      }
+
+      // Si en attente de code PIN Mobile Money (Mode réel / Production)
+      setDepositPushSent(true);
+      setDepositLoading(false);
+
+      // Lancement du polling de statut auprès de l'API
+      let attempts = 0;
+      const pollTimer = setInterval(async () => {
+        attempts++;
+        try {
+          const chkRes = await fetch(`/api/maishapay/check-status/${txRef}`);
+          const chkData = await chkRes.json();
+          if (chkData.status === 'completed') {
+            clearInterval(pollTimer);
+            completeDepositSuccess(txRef, depositAmount, data.operator || depositOperator);
+          } else if (chkData.status === 'failed') {
+            clearInterval(pollTimer);
+            setDepositPushSent(false);
+            setDepositError(chkData.message || 'La transaction a été refusée ou annulée sur votre téléphone.');
+          } else if (attempts >= 40) {
+            clearInterval(pollTimer);
+            setDepositPushSent(false);
+            setDepositError("Délai d'attente dépassé. Si vous avez validé le code PIN sur votre téléphone, votre solde sera crédité d'ici quelques instants.");
+          }
+        } catch {
+          // Continuer le polling
+        }
+      }, 3000);
+    } catch (err: any) {
+      setDepositError("Erreur de connexion au serveur de paiement MaishaPay.");
+      setDepositLoading(false);
     }
-    window.dispatchEvent(new Event('renttech_data_sync'));
-
-    setUserHistory(prev => [
-      {
-        id: txId,
-        type: 'deposit',
-        title: `Recharge (${selectedPack.name})`,
-        amount: depositAmount,
-        status: 'en_attente',
-        date: new Date().toISOString().replace('T', ' ').substring(0, 16),
-        hash
-      },
-      ...prev
-    ]);
-
-    setTicker(prev => [
-      { id: Date.now(), user: `${user.fullName.split(' ')[0]} K.`, action: `a soumis une recharge de ${selectedPack.name}`, amount: `${depositAmount.toLocaleString('fr-FR')} FC`, time: 'à l\'instant', type: 'deposit' },
-      ...prev
-    ]);
-
-    setDepositHash(hash);
-    setDepositSuccess(true);
   };
 
   // SOUMISSION RETRAIT AIRTEL MONEY SÉCURISÉ (ULTRA PRO VERIFICATION)
@@ -2070,32 +2179,27 @@ export default function App() {
               </div>
             )}
 
-            {/* VUE 2 : DEPOSIT / RECHARGER AIRTEL */}
+            {/* VUE 2 : DEPOSIT / RECHARGE MOBILE MONEY AUTOMATIQUE MAISHAPAY */}
             {activeView === 'deposit' && (
               <div className="space-y-6 animate-fade-in">
                 
-                {/* Consignes Airtel */}
+                {/* Consignes MaishaPay Mobile Money Automatique */}
                 <div className="bg-white border border-slate-200 rounded-3xl p-6 shadow-xs">
                   <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
                     <div className="flex items-center gap-4">
                       <div className="p-3 bg-blue-50 rounded-2xl border border-blue-100 text-blue-600">
-                        <Phone className="w-8 h-8" />
+                        <Phone className="w-8 h-8 animate-pulse" />
                       </div>
                       <div>
-                        <h4 className="text-lg font-bold text-slate-900">Procédure de Dépôt Airtel Money</h4>
-                        <p className="text-xs text-slate-500">Effectuez le transfert manuel puis soumettez votre capture de confirmation.</p>
+                        <h4 className="text-lg font-bold text-slate-900">Recharge Automatique Mobile Money (MaishaPay)</h4>
+                        <p className="text-xs text-slate-500">Paiement instantané par push USSD/STK. Plus besoin d'envoyer de capture d'écran !</p>
                       </div>
                     </div>
 
-                    <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 w-full md:w-auto grid grid-cols-2 gap-6 text-center">
-                      <div>
-                        <span className="text-xs text-slate-500 block font-semibold">Numéro Officiel Airtel</span>
-                        <span className="text-lg font-extrabold text-slate-900 font-mono">+243976704762</span>
-                      </div>
-                      <div>
-                        <span className="text-xs text-slate-500 block font-semibold">Nom Obligatoire</span>
-                        <span className="text-lg font-extrabold text-blue-600 font-mono">MYATSI</span>
-                      </div>
+                    <div className="bg-slate-50 border border-slate-200 rounded-2xl p-3 w-full md:w-auto flex flex-wrap items-center justify-center gap-2">
+                      <span className="px-2.5 py-1 bg-red-100 text-red-700 text-xs font-bold rounded-lg border border-red-200">Airtel Money</span>
+                      <span className="px-2.5 py-1 bg-blue-100 text-blue-700 text-xs font-bold rounded-lg border border-blue-200">Vodacom M-Pesa</span>
+                      <span className="px-2.5 py-1 bg-amber-100 text-amber-800 text-xs font-bold rounded-lg border border-amber-200">Orange Money</span>
                     </div>
                   </div>
                 </div>
@@ -2103,7 +2207,7 @@ export default function App() {
                 <div className="bg-white border border-slate-200 rounded-3xl p-6 sm:p-8 shadow-xs space-y-4">
                   <div className="flex items-center justify-between border-b border-slate-100 pb-4">
                     <h3 className="text-lg font-bold text-slate-900 flex items-center gap-2">
-                      <PlusCircle className="w-5 h-5 text-blue-600" /> Formulaire de Recharge avec Preuve de Paiement
+                      <PlusCircle className="w-5 h-5 text-blue-600" /> Formulaire de Recharge Push Mobile Money
                     </h3>
                     <button 
                       onClick={() => setActiveView('overview')} 
@@ -2119,19 +2223,21 @@ export default function App() {
                     </div>
                   )}
 
+                  {/* ÉTAT 1 : SUCCÈS CONFIRMÉ */}
                   {depositSuccess ? (
                     <div className="p-8 bg-emerald-50 border border-emerald-200 rounded-3xl text-center space-y-4">
                       <div className="w-16 h-16 bg-emerald-100 border border-emerald-300 rounded-full flex items-center justify-center mx-auto text-emerald-600 shadow-xs">
                         <CheckCircle2 className="w-10 h-10" />
                       </div>
-                      <h4 className="text-xl font-bold text-emerald-800">Demande de Recharge Soumise !</h4>
-                      <p className="text-xs text-slate-600 max-w-md mx-auto">Votre capture d'écran a été chiffrée et transmise à l'administrateur avec signature cryptographique.</p>
+                      <h4 className="text-xl font-bold text-emerald-800">Simulation de recharge terminée</h4>
+                      <p className="text-xs text-slate-600 max-w-md mx-auto">Aucun paiement réel n’a été effectué. Cette simulation modifie uniquement les données locales de démonstration.</p>
 
                       <div className="p-4 bg-white rounded-2xl border border-emerald-200 font-mono text-xs space-y-1 text-left max-w-md mx-auto shadow-xs">
-                        <span className="text-slate-400 block text-[10px]">REÇU TRANSMISSION:</span>
+                        <span className="text-slate-400 block text-[10px]">RÉFÉRENCE DE SIMULATION :</span>
                         <div className="text-blue-600 font-bold truncate">{depositHash}</div>
-                        <div className="text-slate-700">Montant déclaré : {depositAmount.toLocaleString('fr-FR')} FC</div>
-                        <div className="text-emerald-600 font-bold">Statut : EN ATTENTE D'APPROBATION DIREX</div>
+                        <div className="text-slate-700">Montant crédité : {depositAmount.toLocaleString('fr-FR')} FC</div>
+                        <div className="text-slate-700">Numéro débité : {depositPhone} ({depositOperator})</div>
+                        <div className="text-emerald-600 font-bold">Statut : SIMULATION</div>
                       </div>
 
                       <button 
@@ -2144,10 +2250,50 @@ export default function App() {
                         Retour au Tableau de Bord
                       </button>
                     </div>
+                  ) : depositPushSent ? (
+                    /* ÉTAT 2 : PUSH ENVOYÉ / EN ATTENTE DU CODE PIN SUR LE TÉLÉPHONE */
+                    <div className="p-8 bg-blue-50 border border-blue-200 rounded-3xl text-center space-y-5 animate-pulse">
+                      <div className="w-20 h-20 bg-blue-600 text-white rounded-full flex items-center justify-center mx-auto shadow-lg">
+                        <Phone className="w-10 h-10 animate-bounce" />
+                      </div>
+                      <div>
+                        <h4 className="text-xl font-extrabold text-blue-900">Push Mobile Money Envoyé sur votre Téléphone !</h4>
+                        <p className="text-sm font-semibold text-blue-700 mt-1">Numéro destinataire : <span className="font-mono font-bold text-slate-900">{depositPhone}</span> ({depositOperator})</p>
+                      </div>
+
+                      <div className="p-5 bg-white rounded-2xl border border-blue-200 max-w-md mx-auto text-left space-y-3 shadow-xs">
+                        <div className="flex items-start gap-3">
+                          <span className="w-6 h-6 rounded-full bg-blue-600 text-white text-xs font-bold flex items-center justify-center shrink-0 mt-0.5">1</span>
+                          <p className="text-xs text-slate-700 font-medium">Regardez l'écran de votre téléphone : une invite Mobile Money vient d'apparaître.</p>
+                        </div>
+                        <div className="flex items-start gap-3">
+                          <span className="w-6 h-6 rounded-full bg-blue-600 text-white text-xs font-bold flex items-center justify-center shrink-0 mt-0.5">2</span>
+                          <p className="text-xs text-slate-700 font-medium">Saisissez votre <strong className="text-slate-900">mot de passe / code PIN Mobile Money</strong> pour autoriser le montant de <strong className="text-blue-600 font-mono">{depositAmount.toLocaleString('fr-FR')} FC</strong>.</p>
+                        </div>
+                        <div className="flex items-start gap-3">
+                          <span className="w-6 h-6 rounded-full bg-emerald-600 text-white text-xs font-bold flex items-center justify-center shrink-0 mt-0.5">3</span>
+                          <p className="text-xs text-emerald-800 font-semibold">Dès que vous validez, cette page s'actualise automatiquement et crédite votre portefeuille !</p>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center justify-center gap-2 text-xs text-slate-500 font-medium">
+                        <span className="inline-block w-2.5 h-2.5 rounded-full bg-blue-600 animate-ping"></span>
+                        <span>Attente de votre confirmation PIN sur le téléphone...</span>
+                      </div>
+
+                      <button 
+                        type="button"
+                        onClick={() => setDepositPushSent(false)} 
+                        className="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold text-xs rounded-xl transition-all"
+                      >
+                        Modifier le numéro ou réinitialiser
+                      </button>
+                    </div>
                   ) : (
+                    /* ÉTAT 3 : FORMULAIRE DE SAISIE SANS CAPTURE D'ÉCRAN */
                     <form onSubmit={handleDepositSubmit} className="space-y-4">
                       <div>
-                        <label className="block text-xs font-semibold text-slate-700 mb-1">Nom du Pack Choisi</label>
+                        <label className="block text-xs font-semibold text-slate-700 mb-1">Pack d'Investissement / Destination</label>
                         <input 
                           type="text" 
                           value={selectedPack.name} 
@@ -2157,55 +2303,80 @@ export default function App() {
                         />
                       </div>
 
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        <div>
+                          <label className="block text-xs font-semibold text-slate-700 mb-1">Réseau Mobile Money</label>
+                          <select 
+                            value={depositOperator} 
+                            onChange={(e) => setDepositOperator(e.target.value)}
+                            className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm text-slate-900 focus:border-blue-500 focus:outline-none font-semibold"
+                          >
+                            <option value="AIRTEL">Airtel Money (097, 098, 099)</option>
+                            <option value="MPESA">Vodacom M-Pesa (081, 082, 083)</option>
+                            <option value="ORANGE">Orange Money (084, 085, 089, 080)</option>
+                            <option value="AFRICELL">Africell Money (090, 091)</option>
+                          </select>
+                        </div>
+
+                        <div>
+                          <label className="block text-xs font-semibold text-slate-700 mb-1">Numéro Mobile Money (10 chiffres)</label>
+                          <div className="relative">
+                            <input 
+                              type="tel" 
+                              value={depositPhone} 
+                              onChange={(e) => handlePhoneChange(e.target.value)}
+                              placeholder="ex: 0992611845"
+                              className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm text-slate-900 focus:border-blue-500 focus:outline-none font-mono font-bold" 
+                              required 
+                            />
+                            <span className="absolute right-3 top-3 text-[10px] font-extrabold uppercase px-2 py-0.5 rounded-md bg-blue-100 text-blue-700">
+                              {depositOperator}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
                       <div>
-                        <label className="block text-xs font-semibold text-slate-700 mb-1">Montant envoyé via Airtel Money (FC)</label>
+                        <div className="flex justify-between items-center mb-1">
+                          <label className="text-xs font-semibold text-slate-700">Montant de la recharge (FC)</label>
+                          <span className="text-[11px] text-slate-500 font-medium">Minimum : 5 000 FC</span>
+                        </div>
                         <input 
                           type="number" 
                           value={depositAmount} 
                           onChange={(e) => setDepositAmount(Number(e.target.value))}
-                          className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm text-slate-900 focus:border-blue-500 focus:outline-none font-mono" 
+                          className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm text-slate-900 focus:border-blue-500 focus:outline-none font-mono font-bold text-lg" 
+                          min="5000"
                           required 
                         />
+
+                        {/* Raccourcis de montants */}
+                        <div className="flex flex-wrap gap-2 mt-2">
+                          {[15000, 30000, 80000, 100000, 300000].map((amt) => (
+                            <button
+                              key={amt}
+                              type="button"
+                              onClick={() => setDepositAmount(amt)}
+                              className={`px-2.5 py-1 text-xs rounded-lg font-mono font-semibold transition-all ${
+                                depositAmount === amt 
+                                  ? 'bg-blue-600 text-white shadow-xs' 
+                                  : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                              }`}
+                            >
+                              {amt.toLocaleString('fr-FR')} FC
+                            </button>
+                          ))}
+                        </div>
                       </div>
 
-                      <div>
-                        <label className="block text-xs font-semibold text-slate-700 mb-1">Capture d'Écran de Preuve de Paiement (JPG, PNG)</label>
-                        <input 
-                          id="deposit-proof-file-input"
-                          type="file" 
-                          accept="image/*"
-                          onChange={handleProofFileChange}
-                          className="hidden"
-                        />
-                        <label 
-                          htmlFor="deposit-proof-file-input"
-                          className="border-2 border-dashed border-blue-200 hover:border-blue-400 rounded-2xl p-5 text-center transition-all cursor-pointer bg-slate-50 block relative overflow-hidden group shadow-inner"
-                        >
-                          {depositProofPreview ? (
-                            <div className="space-y-3">
-                              <img 
-                                src={depositProofPreview} 
-                                alt="Preuve de paiement Airtel" 
-                                className="max-h-48 mx-auto rounded-xl object-contain border border-slate-300 shadow-md"
-                              />
-                              <div className="flex items-center justify-center gap-2 text-xs text-blue-600 font-bold">
-                                <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                                <span>{depositProofFileName || "Capture de paiement sélectionnée avec succès"}</span>
-                                <span className="text-slate-500 text-[10px] underline hover:text-slate-800">(Cliquer pour modifier)</span>
-                              </div>
-                            </div>
-                          ) : (
-                            <div className="space-y-2">
-                              <Upload className="w-9 h-9 text-blue-600 mx-auto group-hover:scale-105 transition-transform" />
-                              <span className="text-xs text-blue-700 font-bold block">
-                                Cliquez ici pour sélectionner votre capture de confirmation Airtel Money
-                              </span>
-                              <span className="text-[10px] text-slate-500 block">
-                                Format image accepté • Chiffrement SHA-256 direct vers la Trésorerie MYATSI
-                              </span>
-                            </div>
-                          )}
-                        </label>
+                      <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200 text-xs text-slate-600 space-y-1">
+                        <div className="flex items-center gap-1.5 font-bold text-slate-800">
+                          <ShieldCheck className="w-4 h-4 text-emerald-600" />
+                          <span>Paiement Direct & Sécurisé MaishaPay</span>
+                        </div>
+                        <p className="text-[11px] leading-relaxed">
+                          Aucun transfert manuel requis : dès que vous cliquez sur le bouton ci-dessous, notre passerelle envoie une requête push sur votre téléphone. Il vous suffit d'y entrer votre code secret Mobile Money pour valider.
+                        </p>
                       </div>
 
                       {!isOnline && (
@@ -2217,20 +2388,21 @@ export default function App() {
 
                       <button 
                         type="submit" 
-                        disabled={!isOnline}
+                        disabled={!isOnline || depositLoading}
                         className={`w-full font-bold py-3.5 rounded-xl text-sm transition-all shadow-xs flex items-center justify-center gap-2 ${
-                          !isOnline 
-                            ? 'bg-slate-100 text-slate-400 border border-slate-200 cursor-not-allowed' 
+                          !isOnline || depositLoading
+                            ? 'bg-slate-200 text-slate-400 border border-slate-200 cursor-not-allowed' 
                             : 'bg-blue-600 hover:bg-blue-700 text-white'
                         }`}
                       >
-                        {isOnline ? (
+                        {depositLoading ? (
                           <>
-                            <ShieldCheck className="w-4 h-4" /> Soumettre la Preuve de Recharge Sécurisée
+                            <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+                            <span>Envoi du push sur votre téléphone...</span>
                           </>
                         ) : (
                           <>
-                            <WifiOff className="w-4 h-4 text-rose-600" /> {t.offlineSubmitBlocked}
+                            <Phone className="w-4 h-4" /> Lancer la Recharge Push Mobile Money
                           </>
                         )}
                       </button>
