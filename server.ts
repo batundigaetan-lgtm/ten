@@ -1,6 +1,5 @@
 import express from "express";
 import path from "path";
-import crypto from "crypto";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
@@ -8,16 +7,10 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT ?? 3000);
 
 // Capture du corps brut (raw body) pour la vérification cryptographique HMAC-SHA256 du webhook
-app.use(
-  express.json({
-    verify: (req: any, _res, buf) => {
-      req.rawBody = buf;
-    },
-  })
-);
+app.use(express.json());
 
 // Initialisation du client Gemini
 const apiKey = process.env.GEMINI_API_KEY;
@@ -167,46 +160,65 @@ app.post("/api/ai-support", async (req, res) => {
 // ENDPOINTS SÉCURISÉS SERVEUR : MAISHAPAY GATEWAY
 // (Les clés secrètes restent strictement côté serveur)
 // ========================================================
-const MAISHAPAY_API_KEY = process.env.MAISHAPAY_API_KEY || "";
-const MAISHAPAY_SECRET_KEY = process.env.MAISHAPAY_SECRET_KEY || "";
-const MAISHAPAY_MERCHANT_ID = process.env.MAISHAPAY_MERCHANT_ID || "";
+const MAISHAPAY_MODE = Number(process.env.MAISHAPAY_MODE ?? 0);
+const sandboxTransactionReferences = new Set<string>();
 
-// 1. Initialisation d'une session de dépôt sécurisée MaishaPay
+// Helper de nettoyage et détection d'opérateur Mobile Money RDC
+function detectOperatorAndCleanPhone(rawPhone: string, chosenOperator?: string) {
+  let cleaned = String(rawPhone || "").replace(/[^0-9]/g, "");
+  if (cleaned.length === 12 && cleaned.startsWith("243")) {
+    cleaned = "0" + cleaned.substring(3);
+  } else if (cleaned.length === 9) {
+    cleaned = "0" + cleaned;
+  }
+
+  const pre = cleaned.substring(0, 3);
+  let op = "";
+  if (["097", "098", "099"].includes(pre)) op = "AIRTEL";
+  else if (["081", "082", "083"].includes(pre)) op = "MPESA";
+  else if (["084", "085", "089", "080"].includes(pre)) op = "ORANGE";
+  else if (["090", "091"].includes(pre)) op = "AFRICELL";
+  if (chosenOperator && chosenOperator.toUpperCase() !== op) op = "";
+
+  return { phone: cleaned, operator: op };
+}
+
+// Simulation de dépôt pour le parcours React de développement uniquement.
 app.post("/api/maishapay/initiate-deposit", async (req, res) => {
   try {
-    const { amount, phone, userId, currency = "CDF" } = req.body;
-
-    if (!amount || amount < 5000) {
-      return res.status(400).json({ error: "Le montant minimum de dépôt est de 5 000 FC." });
-    }
-
-    if (!userId) {
-      return res.status(400).json({ error: "Identifiant utilisateur requis." });
-    }
-
-    const transactionReference = `MP-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
-
-    // Si les clés MaishaPay sont configurées dans l'environnement serveur
-    if (MAISHAPAY_API_KEY && MAISHAPAY_SECRET_KEY) {
-      // Préparation de l'appel direct vers l'API MaishaPay avec les secrets serveur
-      return res.json({
-        success: true,
-        reference: transactionReference,
-        amount,
-        currency,
-        status: "pending_payment",
-        message: "Session de paiement MaishaPay initialisée côté serveur.",
+    if (MAISHAPAY_MODE !== 0 || process.env.NODE_ENV === "production") {
+      return res.status(503).json({
+        error: "Le paiement React ne dispose pas d'un stockage serveur sécurisé. Utilisez le parcours PHP/MySQL configuré pour les paiements réels.",
       });
     }
 
-    // Si les clés MaishaPay sont encore en attente d'injection dans les secrets
+    const { amount, phone: rawPhone, operator: reqOp } = req.body;
+
+    const numAmount = Number(amount);
+    if (!Number.isFinite(numAmount) || numAmount < 5000) {
+      return res.status(400).json({ error: "Le montant minimum de dépôt est de 5 000 FC." });
+    }
+
+    if (!rawPhone) {
+      return res.status(400).json({ error: "Numéro Mobile Money requis pour l'envoi du push." });
+    }
+
+    const { phone, operator } = detectOperatorAndCleanPhone(rawPhone, reqOp);
+    if (!/^0\d{9}$/.test(phone) || !operator) {
+      return res.status(400).json({ error: "Numéro ou opérateur Mobile Money invalide." });
+    }
+
+    const transactionReference = `TEST-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
+    sandboxTransactionReferences.add(transactionReference);
     return res.json({
       success: true,
       reference: transactionReference,
-      amount,
-      currency,
-      status: "pending_configuration",
-      message: "Session préparée. En attente de validation du paiement via le webhook sécurisé.",
+      amount: numAmount,
+      currency: "CDF",
+      phone,
+      operator,
+      status: "completed",
+      message: `[Mode Sandbox] Simulation de ${numAmount.toLocaleString("fr-FR")} FC terminée. Aucun paiement réel n'a été effectué.`,
     });
   } catch (err: any) {
     console.error("[MaishaPay] Erreur initiation :", err);
@@ -214,89 +226,34 @@ app.post("/api/maishapay/initiate-deposit", async (req, res) => {
   }
 });
 
-// Cache mémoire pour l'idempotence des webhooks (prévention des attaques par rejeu et notifications répétées)
-const processedWebhookReferences = new Set<string>();
-
-// 2. Webhook officiel de confirmation de paiement MaishaPay
-// Règles 5, 6, 7 & 10 : Vérification d'authenticité HMAC-SHA256 sur le corps brut (raw body)
-app.post("/api/maishapay/webhook", async (req: any, res) => {
+// Endpoint de vérification en temps réel du statut d'une transaction MaishaPay
+app.get("/api/maishapay/check-status/:ref", async (req, res) => {
   try {
-    const signatureHeader = (req.headers["x-maishapay-signature"] || req.headers["maishapay-signature"]) as string;
-    const payload = req.body;
-    const rawBodyBuffer: Buffer | undefined = req.rawBody;
-
-    console.log("[MaishaPay Webhook] Réception de notification :", {
-      status: payload?.status,
-      reference: payload?.transaction_reference || payload?.reference,
-    });
-
-    const transactionRef = String(payload?.transaction_reference || payload?.reference || payload?.id || "");
-
-    // 1. Protection contre les notifications répétées (Idempotence)
-    if (transactionRef && processedWebhookReferences.has(transactionRef)) {
-      console.log(`[MaishaPay Webhook] Notification déjà traitée pour la référence ${transactionRef}. Idempotence respectée.`);
-      return res.status(200).json({ status: "already_processed", reference: transactionRef });
+    const { ref } = req.params;
+    if (!ref) {
+      return res.status(400).json({ error: "Référence requise." });
     }
 
-    // 2. Vérification cryptographique HMAC-SHA256 si la clé secrète serveur est configurée
-    if (MAISHAPAY_SECRET_KEY) {
-      if (!signatureHeader || !rawBodyBuffer) {
-        console.warn("[MaishaPay Webhook] Signature manquante dans les en-têtes.");
-        return res.status(401).json({ error: "Signature de sécurité manquante." });
-      }
-
-      // Calcul de la signature HMAC-SHA256 attendue à partir du corps brut
-      const expectedSignature = crypto
-        .createHmac("sha256", MAISHAPAY_SECRET_KEY)
-        .update(rawBodyBuffer)
-        .digest("hex");
-
-      const signatureBuffer = Buffer.from(signatureHeader, "utf8");
-      const expectedBuffer = Buffer.from(expectedSignature, "utf8");
-
-      // Comparaison en temps constant (Timing-Safe) contre les attaques temporelles
-      if (
-        signatureBuffer.length !== expectedBuffer.length ||
-        !crypto.timingSafeEqual(signatureBuffer, expectedBuffer)
-      ) {
-        console.warn("[MaishaPay Webhook] Échec de la vérification de signature HMAC-SHA256.");
-        return res.status(403).json({ error: "Signature HMAC invalide. Requête non authentique." });
-      }
-
-      console.log("[MaishaPay Webhook] Signature HMAC-SHA256 vérifiée avec succès.");
+    if (MAISHAPAY_MODE !== 0 || process.env.NODE_ENV === "production") {
+      return res.status(503).json({ error: "La vérification est désactivée sur le backend React." });
     }
 
-    // 3. Vérification stricte du statut de paiement
-    // Règle 7 : Ne crédite JAMAIS un dépôt sans confirmation authentique
-    const paymentStatus = String(payload?.status || "").toLowerCase().trim();
-    const isPaymentConfirmed = paymentStatus === "success" || paymentStatus === "completed" || paymentStatus === "paid";
-
-    if (!isPaymentConfirmed) {
-      console.warn(`[MaishaPay Webhook] Paiement non confirmé (statut: ${paymentStatus}). Aucun crédit accordé.`);
-      return res.status(200).json({ status: "ignored", reason: "payment_status_not_confirmed" });
+    if (!sandboxTransactionReferences.has(ref)) {
+      return res.status(404).json({ error: "Référence de simulation introuvable." });
     }
 
-    // 4. Marquer la transaction comme traitée (Idempotence)
-    if (transactionRef) {
-      processedWebhookReferences.add(transactionRef);
-    }
-
-    const depositedAmount = Number(payload?.amount || 0);
-    const userId = payload?.user_id || payload?.metadata?.user_id || payload?.custom_fields?.user_id;
-
-    console.log(`[MaishaPay Webhook] Dépôt de ${depositedAmount} FC confirmé pour l'utilisateur ${userId || 'inconnu'}.`);
-    console.log(`[MaishaPay Webhook] Activation automatique du compte et crédit du portefeuille déclenchés.`);
-
-    return res.status(200).json({
-      status: "processed",
-      reference: transactionRef,
-      is_activated: true,
-      message: "Notification authentifiée. Dépôt validé et compte activé avec succès.",
-    });
+    return res.json({ status: "completed", message: "Simulation terminée. Aucun paiement réel n'a été effectué." });
   } catch (err: any) {
-    console.error("[MaishaPay Webhook] Erreur serveur lors du traitement :", err);
-    return res.status(500).json({ error: "Erreur interne lors du traitement du webhook." });
+    console.error("[MaishaPay Sandbox] Erreur de vérification :", err);
+    return res.status(500).json({ error: "Erreur lors de la vérification de la simulation." });
   }
+});
+
+// Le backend React ne reçoit pas les callbacks des paiements réels.
+app.post("/api/maishapay/webhook", (_req, res) => {
+  return res.status(503).json({
+    error: "Webhook indisponible sur le backend React; configurez le callback PHP/MySQL.",
+  });
 });
 
 // 3. API Sécurisée de Vérification Préalable des Retraits

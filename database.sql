@@ -27,20 +27,24 @@ CREATE TABLE IF NOT EXISTS `users` (
   INDEX `idx_referred_by` (`referred_by`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- 2. Table des Dépôts Airtel Money (0992611845 - KAMBALE)
+-- 2. Table des Dépôts Automatiques Mobile Money (MaishaPay API - Airtel, Vodacom, Orange)
 CREATE TABLE IF NOT EXISTS `deposits` (
   `id` INT AUTO_INCREMENT PRIMARY KEY,
   `user_id` INT NOT NULL,
   `amount` DECIMAL(15, 2) NOT NULL,
-  `airtel_sender_phone` VARCHAR(20) NOT NULL,
-  `proof_image` VARCHAR(255) NOT NULL,
+  `level_name` VARCHAR(100) DEFAULT NULL,
+  `operator` VARCHAR(30) NOT NULL DEFAULT 'AIRTEL',
+  `airtel_sender_phone` VARCHAR(30) DEFAULT NULL,
+  `proof_image` VARCHAR(255) DEFAULT NULL,
   `transaction_ref` VARCHAR(100) DEFAULT NULL,
+  `gateway_txn_id` VARCHAR(100) DEFAULT NULL,
   `status` ENUM('en_attente', 'approuve', 'rejete') NOT NULL DEFAULT 'en_attente',
   `admin_note` TEXT DEFAULT NULL,
   `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
   `processed_at` DATETIME DEFAULT NULL,
   CONSTRAINT `fk_deposits_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE,
-  INDEX `idx_deposit_status` (`status`)
+  INDEX `idx_deposit_status` (`status`),
+  UNIQUE INDEX `uq_deposit_transaction_ref` (`transaction_ref`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- 3. Table des Retraits Airtel Money
