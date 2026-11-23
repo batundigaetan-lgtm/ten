@@ -261,8 +261,14 @@ export const AuthGate: React.FC<AuthGateProps> = ({ onLoginSuccess }) => {
       }
 
       setRegSuccess('🎉 Compte créé avec succès dans Supabase ! Connexion en cours...');
-      setTimeout(() => {
-        if (res.user) {
+      setTimeout(async () => {
+        try {
+          const session = await authService.getCurrentSession();
+          if (!session?.user || !res.user) {
+            setRegSuccess('Compte créé. Connectez-vous pour accéder à votre portefeuille.');
+            return;
+          }
+
           onLoginSuccess({
             name: res.user.fullName,
             email: res.user.email,
@@ -271,6 +277,9 @@ export const AuthGate: React.FC<AuthGateProps> = ({ onLoginSuccess }) => {
             referralCode: res.user.referralCode,
             balance: res.user.balance,
           });
+        } catch (error) {
+          console.error('[Supabase] Impossible de restaurer la session après inscription:', error);
+          setRegError('Compte créé, mais la session n’a pas pu être ouverte. Connectez-vous avec vos identifiants.');
         }
       }, 1200);
       return;

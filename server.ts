@@ -2,15 +2,43 @@ import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
+import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import dotenv from "dotenv";
+import { Database } from "./src/types/supabase";
 
 dotenv.config();
 
 const app = express();
 const PORT = Number(process.env.PORT ?? 3000);
 
-// Capture du corps brut (raw body) pour la vérification cryptographique HMAC-SHA256 du webhook
 app.use(express.json());
+
+let supabaseAdmin: SupabaseClient<Database> | null = null;
+
+function getSupabaseAdmin() {
+  if (supabaseAdmin) return supabaseAdmin;
+
+  const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !serviceKey) {
+    throw new Error("Supabase server credentials are missing.");
+  }
+
+  supabaseAdmin = createClient<Database>(url, serviceKey, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+  return supabaseAdmin;
+}
+
+async function getAuthenticatedUser(req: express.Request) {
+  const authorization = req.header("authorization") || "";
+  const token = authorization.match(/^Bearer\s+(.+)$/i)?.[1];
+  if (!token) throw new Error("Authentication is required.");
+
+  const { data, error } = await getSupabaseAdmin().auth.getUser(token);
+  if (error || !data.user) throw new Error("Supabase session is invalid or expired.");
+  return data.user;
+}
 
 // Initialisation du client Gemini
 const apiKey = process.env.GEMINI_API_KEY;
@@ -46,7 +74,7 @@ RÈGLES D'INFORMATIONS EXACTES & CONFIDENTIALITÉ :
 3. RETRAITS AIRTEL MONEY:
    - Montant minimum de retrait : 5 000 FC.
    - Les retraits sont versés directement sur le numéro Airtel Money fourni par l'investisseur.
-   - Traitement ultra-rapide par la trésorerie Direction MYATSI.
+   - MaishaPay confirme le résultat final du transfert avant que l'application n'affiche le retrait comme effectué.
 
 4. MATRICE DES 8 PACKS DE LOCATION & RENDEMENTS:
    - Niveau 1 - Pack Découverte iPad Mini : 15 000 FC (Commission 20%: 3 000 FC | Gain estimé: 750 FC/jour)
@@ -123,7 +151,7 @@ app.post("/api/ai-support", async (req, res) => {
         msgLower.includes("solde")
       ) {
         reply =
-          "Pour effectuer un **retrait** de votre solde :\n\n1. Rendez-vous dans l'onglet **Demande de Retrait**.\n2. Saisissez le montant souhaité (minimum **5 000 FC**).\n3. Indiquez votre numéro Airtel Money.\n4. Soumettez la demande. La trésorerie valide le transfert vers votre compte mobile.";
+          "Pour effectuer un **retrait** de votre solde :\n\n1. Rendez-vous dans l'onglet **Demande de Retrait**.\n2. Saisissez le montant souhaité (minimum **5 000 FC**).\n3. Indiquez votre numéro Airtel Money.\n4. Soumettez la demande. MaishaPay exécute le transfert et l'application affiche le retrait comme effectué uniquement après confirmation finale.";
       } else if (
         msgLower.includes("pack") ||
         msgLower.includes("niveau") ||
@@ -161,29 +189,18 @@ app.post("/api/ai-support", async (req, res) => {
 // (Les clés secrètes restent strictement côté serveur)
 // ========================================================
 function getMaishaPayConfig() {
-  dotenv.config({ override: true });
   return {
     publicKey: process.env.MAISHAPAY_PUBLIC_KEY || "",
     secretKey: process.env.MAISHAPAY_SECRET_KEY || "",
     mode: Number(process.env.MAISHAPAY_MODE ?? 1),
-    apiUrl: process.env.MAISHAPAY_API_URL || "https://marchand.maishapay.online/api/payment/rest/vers1.0/merchant",
+    collectionUrl: process.env.MAISHAPAY_COLLECTION_URL || "https://marchand.maishapay.online/api/collect/v2/store/mobileMoney",
+    transferUrl: process.env.MAISHAPAY_TRANSFER_URL || "https://marchand.maishapay.online/api/b2c/store/transfert/mobilemoney",
     checkUrl: process.env.MAISHAPAY_CHECK_URL || "https://marchand.maishapay.online/api/transaction/rest/v2/check",
     appUrl: process.env.APP_URL || "http://localhost:3000",
   };
 }
 
-// Mémoire des transactions pour le suivi en direct
-const activeTransactions = new Map<string, {
-  reference: string;
-  amount: number;
-  phone: string;
-  operator: string;
-  status: 'pending_pin' | 'completed' | 'failed';
-  gatewayTxnId?: string;
-  createdAt: number;
-}>();
-
-// Helper d'appel HTTPS sécurisé vers MaishaPay évitant les blocages de certificat intermédiaire sous Windows
+// Helper d'appel HTTPS vers MaishaPay.
 async function callMaishaPay(url: string, payload: any) {
   const https = await import("https");
   return new Promise<{ status: number; data: any; raw: string }>((resolve, reject) => {
@@ -200,7 +217,6 @@ async function callMaishaPay(url: string, payload: any) {
         "Accept": "application/json",
         "Content-Length": Buffer.byteLength(postData),
       },
-      rejectUnauthorized: false,
     };
 
     const req = https.request(options, (res) => {
@@ -241,15 +257,428 @@ function detectOperatorAndCleanPhone(rawPhone: string, chosenOperator?: string) 
   return { phone: cleaned, operator: op };
 }
 
+function getGatewayPaymentStatus(data: any): "succeeded" | "failed" | "pending" {
+  const words = [
+    data?.status,
+    data?.transactionStatus,
+    data?.statusDescription,
+    data?.status_description,
+    data?.data?.status,
+    data?.data?.transactionStatus,
+    data?.data?.statusDescription,
+  ].flatMap((value) => String(value || "").toLowerCase().split(/[^a-z]+/).filter(Boolean));
+
+  if (words.some((word) => ["success", "successful", "completed", "paid", "approved"].includes(word))) {
+    return "succeeded";
+  }
+  if (words.some((word) => ["failed", "failure", "rejected", "declined", "canceled", "cancelled"].includes(word))) {
+    return "failed";
+  }
+  return "pending";
+}
+
+async function checkMaishaPayStatus(reference: string, expectedAmount: number) {
+  const config = getMaishaPayConfig();
+  if (!config.publicKey || !config.secretKey) {
+    throw new Error("MaishaPay server credentials are missing.");
+  }
+
+  const result = await callMaishaPay(`${config.checkUrl}?useRef=1`, {
+    gatewayMode: config.mode,
+    publicApiKey: config.publicKey,
+    secretApiKey: config.secretKey,
+    transactionId: reference,
+  });
+  if (result.status < 200 || result.status >= 300 || !result.data) {
+    throw new Error(`MaishaPay status check failed (HTTP ${result.status}).`);
+  }
+
+  const responseData = result.data?.data || result.data;
+  const gatewayReference = responseData?.transactionReference
+    || responseData?.originatingTransactionId
+    || responseData?.reference;
+  if (gatewayReference && String(gatewayReference) !== reference) {
+    throw new Error("MaishaPay returned a different transaction reference.");
+  }
+
+  const gatewayAmount = Number(
+    responseData?.amount
+      ?? responseData?.cost?.amount
+      ?? responseData?.order?.cost?.amount
+  );
+  if (Number.isFinite(gatewayAmount) && gatewayAmount !== expectedAmount) {
+    throw new Error("MaishaPay returned an amount that does not match the deposit.");
+  }
+  const currency = responseData?.currency
+    ?? responseData?.cost?.currency
+    ?? responseData?.order?.cost?.currency;
+  if (currency && String(currency).toUpperCase() !== "CDF") {
+    throw new Error("MaishaPay returned an unexpected currency.");
+  }
+
+  return { status: getGatewayPaymentStatus(result.data), data: responseData };
+}
+
+async function settleConfirmedDeposit(reference: string, expectedUserId?: string) {
+  const admin = getSupabaseAdmin();
+  const { data: payment, error: paymentError } = await admin
+    .from("transactions")
+    .select("id,user_id,amount,status")
+    .eq("reference_id", reference)
+    .eq("type", "deposit")
+    .maybeSingle();
+
+  if (paymentError) throw new Error("Could not load the deposit record.");
+  if (!payment || (expectedUserId && payment.user_id !== expectedUserId)) {
+    throw new Error("Deposit record was not found.");
+  }
+  if (payment.status === "completed") {
+    return { status: "completed" as const };
+  }
+  if (payment.status !== "pending") {
+    return { status: "failed" as const };
+  }
+
+  const gateway = await checkMaishaPayStatus(reference, Number(payment.amount));
+  if (gateway.status === "pending") {
+    return { status: "pending_pin" as const };
+  }
+
+  if (gateway.status === "failed") {
+    const { error } = await admin
+      .from("transactions")
+      .update({ status: "failed" })
+      .eq("id", payment.id)
+      .eq("status", "pending");
+    if (error) throw new Error("Could not record the failed payment.");
+    return { status: "failed" as const };
+  }
+
+  const { data, error } = await admin.rpc("confirm_deposit_and_activate", {
+    p_user_id: payment.user_id,
+    p_amount: Number(payment.amount),
+    p_reference: reference,
+    p_payment_method: "maishapay",
+  });
+  if (error) throw new Error("MaishaPay confirmed the payment, but Supabase could not credit it.");
+  if (!data || !data.success) {
+    throw new Error(data?.error || "Supabase did not confirm the deposit credit.");
+  }
+
+  return { status: "completed" as const, newBalance: data.new_balance };
+}
+
+function getProviderTransactionId(data: any) {
+  const responseData = data?.data || data;
+  const transactionId = responseData?.transactionId ?? responseData?.transaction_id;
+  return transactionId == null ? null : String(transactionId);
+}
+
+async function getWithdrawalWalletSnapshot(userId: string) {
+  const { data: wallet, error } = await getSupabaseAdmin()
+    .from("wallets")
+    .select("available_balance_cdf,locked_balance_cdf")
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (error || !wallet) throw new Error("Could not load the user's wallet after withdrawal processing.");
+  return {
+    availableBalance: Number(wallet.available_balance_cdf),
+    lockedBalance: Number(wallet.locked_balance_cdf),
+  };
+}
+
+async function persistWithdrawalProviderId(requestId: string, transactionId: string | null) {
+  if (!transactionId) return;
+  const { error } = await getSupabaseAdmin()
+    .from("withdrawal_requests")
+    .update({ provider_transaction_id: transactionId })
+    .eq("id", requestId);
+  if (error) throw new Error("Could not save MaishaPay's transfer ID.");
+}
+
+async function finalizeWithdrawal(
+  requestId: string,
+  success: boolean,
+  providerTransactionId: string | null,
+  errorMessage?: string
+) {
+  const { data, error } = await getSupabaseAdmin().rpc("finalize_withdrawal_request", {
+    p_request_id: requestId,
+    p_success: success,
+    p_reference: requestId,
+    p_error: errorMessage || null,
+    p_provider_transaction_id: providerTransactionId || null,
+  });
+  if (error) throw new Error("MaishaPay returned a final result, but Supabase could not finalize the withdrawal.");
+  if (!data?.success) throw new Error(data?.error || "Supabase did not finalize the withdrawal.");
+
+  const { data: request, error: requestError } = await getSupabaseAdmin()
+    .from("withdrawal_requests")
+    .select("user_id,status,provider_transaction_id")
+    .eq("id", requestId)
+    .maybeSingle();
+  if (requestError || !request) throw new Error("Could not load the finalized withdrawal.");
+  const wallet = await getWithdrawalWalletSnapshot(request.user_id);
+  return {
+    requestId,
+    status: request.status as "pending" | "processed" | "rejected",
+    providerTransactionId: request.provider_transaction_id || providerTransactionId || undefined,
+    ...wallet,
+  };
+}
+
+async function settleConfirmedWithdrawal(requestId: string, expectedUserId?: string) {
+  const admin = getSupabaseAdmin();
+  const { data: withdrawal, error } = await admin
+    .from("withdrawal_requests")
+    .select("id,user_id,amount,status,destination_phone,provider_transaction_id")
+    .eq("id", requestId)
+    .maybeSingle();
+  if (error) throw new Error("Could not load the withdrawal request.");
+  if (!withdrawal || (expectedUserId && withdrawal.user_id !== expectedUserId)) {
+    throw new Error("Withdrawal request was not found.");
+  }
+  if (withdrawal.status === "processed" || withdrawal.status === "rejected") {
+    return {
+      requestId,
+      status: withdrawal.status,
+      providerTransactionId: withdrawal.provider_transaction_id || undefined,
+      ...(await getWithdrawalWalletSnapshot(withdrawal.user_id)),
+    };
+  }
+  if (withdrawal.status !== "pending") {
+    throw new Error("This withdrawal is not awaiting MaishaPay confirmation.");
+  }
+
+  const gateway = await checkMaishaPayStatus(requestId, Number(withdrawal.amount));
+  const gatewayData = gateway.data;
+  const providerTransactionId = getProviderTransactionId(gatewayData);
+  const gatewayPhone = gatewayData?.recipient?.walletID
+    ?? gatewayData?.paymentChannel?.walletID
+    ?? gatewayData?.beneficiary?.walletID;
+  const gatewayOperator = gatewayData?.provider?.libelle
+    ?? gatewayData?.paymentChannel?.provider?.libelle
+    ?? gatewayData?.paymentChannel?.provider;
+  if (gatewayOperator && String(gatewayOperator).toUpperCase() !== "AIRTEL") {
+    throw new Error("MaishaPay returned a different Mobile Money provider than the requested Airtel wallet.");
+  }
+  if (gatewayPhone) {
+    const actualPhone = String(gatewayPhone).replace(/\D/g, "");
+    const expectedPhone = String(withdrawal.destination_phone).replace(/\D/g, "");
+    if (!actualPhone.endsWith(expectedPhone.slice(-9))) {
+      throw new Error("MaishaPay returned a beneficiary phone number that does not match the withdrawal.");
+    }
+  }
+
+  if (gateway.status === "pending") {
+    await persistWithdrawalProviderId(requestId, providerTransactionId);
+    return {
+      requestId,
+      status: "pending" as const,
+      providerTransactionId: providerTransactionId || undefined,
+      ...(await getWithdrawalWalletSnapshot(withdrawal.user_id)),
+    };
+  }
+
+  await persistWithdrawalProviderId(requestId, providerTransactionId);
+  const failureMessage = String(
+    gatewayData?.transactionDescription
+      || gatewayData?.statusDescription
+      || "MaishaPay a refusé le transfert."
+  );
+  return finalizeWithdrawal(
+    requestId,
+    gateway.status === "succeeded",
+    providerTransactionId,
+    gateway.status === "failed" ? failureMessage : undefined
+  );
+}
+
+app.post("/api/maishapay/initiate-withdrawal", async (req, res) => {
+  let requestId = "";
+  try {
+    const user = await getAuthenticatedUser(req);
+    const config = getMaishaPayConfig();
+    const { requestId: rawRequestId, amount, phone: rawPhone } = req.body;
+    requestId = String(rawRequestId || "").toLowerCase();
+    const numAmount = Number(amount);
+
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(requestId)) {
+      return res.status(400).json({ error: "Référence de retrait invalide." });
+    }
+    if (!Number.isSafeInteger(numAmount) || numAmount < 5000) {
+      return res.status(400).json({ error: "Le montant minimum de retrait est de 5 000 FC." });
+    }
+
+    const { phone, operator } = detectOperatorAndCleanPhone(String(rawPhone || ""));
+    if (!/^0\d{9}$/.test(phone) || operator !== "AIRTEL") {
+      return res.status(400).json({ error: "Le retrait MaishaPay est actuellement disponible uniquement vers un numéro Airtel Money valide." });
+    }
+    if (!config.publicKey || !config.secretKey) {
+      return res.status(503).json({ error: "Les clés serveur MaishaPay sont manquantes." });
+    }
+
+    const admin = getSupabaseAdmin();
+    const { data: reservation, error: reservationError } = await admin.rpc("submit_withdrawal_request", {
+      p_request_id: requestId,
+      p_user_id: user.id,
+      p_amount: numAmount,
+      p_destination_phone: phone,
+      p_payment_method: "maishapay_airtel_money",
+    });
+    if (reservationError) throw new Error("Could not reserve the withdrawal in Supabase.");
+    if (!reservation?.success) {
+      return res.status(400).json({ error: reservation?.error || "Impossible de réserver le montant du retrait." });
+    }
+
+    if (reservation.status === "processed" || reservation.status === "rejected") {
+      const current = await settleConfirmedWithdrawal(requestId, user.id);
+      return res.json(current);
+    }
+
+    if (reservation.already_exists) {
+      try {
+        return res.json(await settleConfirmedWithdrawal(requestId, user.id));
+      } catch (reconcileError: any) {
+        console.warn("[MaishaPay Withdrawal] Existing request remains pending:", reconcileError.message);
+        return res.status(202).json({
+          requestId,
+          status: "pending",
+          ...(await getWithdrawalWalletSnapshot(user.id)),
+        });
+      }
+    }
+
+    const callbackUrl = `${config.appUrl}/api/maishapay/withdrawal-webhook?ref=${requestId}`;
+    const payload = {
+      transactionReference: requestId,
+      gatewayMode: config.mode,
+      publicApiKey: config.publicKey,
+      secretApiKey: config.secretKey,
+      order: {
+        motif: "Retrait RentTech",
+        amount: String(numAmount),
+        currency: "CDF",
+        customerFullName: user.user_metadata?.full_name || user.user_metadata?.name || "",
+        customerEmailAdress: user.email || "",
+      },
+      paymentChannel: {
+        provider: operator,
+        walletID: `+243${phone.substring(1)}`,
+        callbackUrl,
+      },
+    };
+
+    let gatewayResponse: { status: number; data: any; raw: string };
+    try {
+      gatewayResponse = await callMaishaPay(config.transferUrl, payload);
+    } catch (gatewayError: any) {
+      console.error("[MaishaPay Withdrawal] Transfer request outcome is unknown:", gatewayError);
+      return res.status(202).json({
+        requestId,
+        status: "pending",
+        ...(await getWithdrawalWalletSnapshot(user.id)),
+      });
+    }
+
+    const gatewayData = gatewayResponse.data?.data || gatewayResponse.data;
+    const providerTransactionId = getProviderTransactionId(gatewayData);
+    await persistWithdrawalProviderId(requestId, providerTransactionId);
+    const gatewayStatus = getGatewayPaymentStatus(gatewayResponse.data);
+
+    if (gatewayStatus === "failed") {
+      const returnedReference = gatewayData?.originatingTransactionId
+        ?? gatewayData?.transactionReference
+        ?? gatewayData?.reference;
+      if (returnedReference && String(returnedReference) !== requestId) {
+        throw new Error("MaishaPay returned a different withdrawal reference.");
+      }
+      const failureMessage = String(
+        gatewayData?.transactionDescription
+          || gatewayData?.statusDescription
+          || "MaishaPay a refusé le transfert."
+      );
+      return res.json(await finalizeWithdrawal(requestId, false, providerTransactionId, failureMessage));
+    }
+
+    if (gatewayStatus === "succeeded") {
+      return res.json(await settleConfirmedWithdrawal(requestId, user.id));
+    }
+
+    return res.status(202).json({
+      requestId,
+      status: "pending",
+      providerTransactionId: providerTransactionId || undefined,
+      ...(await getWithdrawalWalletSnapshot(user.id)),
+    });
+  } catch (err: any) {
+    console.error("[MaishaPay Withdrawal Error]", err);
+    if (requestId) {
+      try {
+        const { data: request } = await getSupabaseAdmin()
+          .from("withdrawal_requests")
+          .select("user_id,status")
+          .eq("id", requestId)
+          .maybeSingle();
+        if (request?.status === "pending") {
+          return res.status(202).json({
+            requestId,
+            status: "pending",
+            ...(await getWithdrawalWalletSnapshot(request.user_id)),
+          });
+        }
+      } catch (reconcileError) {
+        console.error("[MaishaPay Withdrawal] Could not report pending request:", reconcileError);
+      }
+    }
+    return res.status(500).json({ error: err.message || "Erreur serveur lors du retrait MaishaPay." });
+  }
+});
+
+app.get("/api/maishapay/withdrawal-status/:requestId", async (req, res) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+    const requestId = String(req.params.requestId || "").toLowerCase();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(requestId)) {
+      return res.status(400).json({ error: "Référence de retrait invalide." });
+    }
+    return res.json(await settleConfirmedWithdrawal(requestId, user.id));
+  } catch (err: any) {
+    console.error("[MaishaPay Withdrawal Status Error]", err);
+    return res.status(500).json({ error: err.message || "Erreur lors de la vérification du retrait." });
+  }
+});
+
+app.post("/api/maishapay/withdrawal-webhook", async (req, res) => {
+  try {
+    const payload = req.body;
+    const requestId = String(
+      payload?.originatingTransactionId
+        || payload?.transactionReference
+        || req.query.ref
+        || ""
+    ).toLowerCase();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(requestId)) {
+      return res.status(400).json({ error: "Withdrawal reference is required." });
+    }
+    const result = await settleConfirmedWithdrawal(requestId);
+    return res.status(200).json({ status: result.status, reference: requestId });
+  } catch (err: any) {
+    console.error("[MaishaPay Withdrawal Webhook Error]", err);
+    return res.status(500).json({ error: "Could not reconcile the MaishaPay withdrawal." });
+  }
+});
+
 // 1. Initialisation réelle d'un paiement Mobile Money push MaishaPay
 app.post("/api/maishapay/initiate-deposit", async (req, res) => {
   try {
+    const user = await getAuthenticatedUser(req);
     const config = getMaishaPayConfig();
     const { amount, phone: rawPhone, operator: reqOp, customerName, customerEmail } = req.body;
 
     const numAmount = Number(amount);
-    if (!Number.isFinite(numAmount) || numAmount < 1000) {
-      return res.status(400).json({ error: "Le montant minimum de dépôt est de 1 000 FC." });
+    if (!Number.isSafeInteger(numAmount) || numAmount < 5000) {
+      return res.status(400).json({ error: "Le montant minimum de dépôt est de 5 000 FC." });
     }
 
     if (!rawPhone) {
@@ -267,48 +696,78 @@ app.post("/api/maishapay/initiate-deposit", async (req, res) => {
       });
     }
 
+    const admin = getSupabaseAdmin();
+    const { data: wallet, error: walletError } = await admin
+      .from("wallets")
+      .select("id")
+      .eq("user_id", user.id)
+      .maybeSingle();
+    if (walletError || !wallet) {
+      return res.status(400).json({ error: "Le portefeuille Supabase de cet utilisateur est introuvable." });
+    }
+
     const transactionReference = `DEP-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
     const callbackUrl = `${config.appUrl}/api/maishapay/webhook?ref=${transactionReference}`;
+    const { error: insertError } = await admin.from("transactions").insert({
+      wallet_id: wallet.id,
+      user_id: user.id,
+      type: "deposit",
+      amount: numAmount,
+      status: "pending",
+      reference_id: transactionReference,
+      description: "Dépôt MaishaPay en attente de confirmation",
+      payment_method: "maishapay",
+      metadata: { phone, operator },
+    });
+    if (insertError) {
+      console.error("[MaishaPay] Could not create Supabase deposit record:", insertError.message);
+      return res.status(500).json({ error: "Impossible d'enregistrer le dépôt avant le paiement." });
+    }
 
+    const internationalPhone = `+243${phone.substring(1)}`;
     const payload = {
       gatewayMode: config.mode,
       publicApiKey: config.publicKey,
       secretApiKey: config.secretKey,
       transactionReference,
-      amount: numAmount,
-      currency: "CDF",
-      customerFullName: customerName || "Investisseur RentTech",
-      customerPhoneNumber: phone,
-      customerEmailAddress: customerEmail || "investisseur@renttech.com",
-      chanel: "MOBILEMONEY",
-      provider: operator,
-      walletID: phone,
-      callbackUrl,
+      order: {
+        motif: "Dépôt RentTech",
+        amount: numAmount,
+        currency: "CDF",
+        customerFullName: customerName || user.user_metadata?.full_name || "Investisseur RentTech",
+        customerEmailAdress: customerEmail || user.email || "investisseur@renttech.com",
+      },
+      paymentChannel: {
+        channel: "MOBILEMONEY",
+        provider: operator,
+        walletID: internationalPhone,
+        callbackUrl,
+      },
     };
 
-    console.log(`[MaishaPay] Appel API vers ${config.apiUrl} (mode ${config.mode}) pour ${phone} (${operator}) - Montant: ${numAmount} FC`);
+    console.log(`[MaishaPay] Appel API vers ${config.collectionUrl} (mode ${config.mode}) pour ${phone} (${operator}) - Montant: ${numAmount} FC`);
 
-    const result = await callMaishaPay(config.apiUrl, payload);
+    const result = await callMaishaPay(config.collectionUrl, payload);
     const { status: httpStatus, data, raw } = result;
 
-    console.log(`[MaishaPay] Réponse HTTP ${httpStatus}:`, data || raw);
+    console.log(`[MaishaPay] Réponse HTTP ${httpStatus}.`);
 
     const apiData = data?.data || data;
-    const statusCode = Number(apiData?.statusCode || data?.status || httpStatus);
-    const statusDesc = String(apiData?.statusDescription || data?.message || "").toUpperCase();
-    const isAccepted = [200, 201, 202].includes(statusCode) || ["ACCEPTED", "PENDING", "SUCCESS"].includes(statusDesc);
+    const statusCode = Number(apiData?.status_code || apiData?.statusCode || data?.status || httpStatus);
+    const statusDesc = String(apiData?.transactionStatus || apiData?.statusDescription || data?.message || "").toUpperCase();
+    const isAccepted = httpStatus >= 200
+      && httpStatus < 300
+      && ([200, 201, 202].includes(statusCode) || ["ACCEPTED", "PENDING", "SUCCESS", "SUCCEEDED"].includes(statusDesc));
 
     if (isAccepted) {
       const gatewayTxnId = String(apiData?.transactionId || data?.transactionId || "");
-      activeTransactions.set(transactionReference, {
-        reference: transactionReference,
-        amount: numAmount,
-        phone,
-        operator,
-        status: "pending_pin",
-        gatewayTxnId,
-        createdAt: Date.now(),
-      });
+      if (gatewayTxnId) {
+        const { error } = await admin
+          .from("transactions")
+          .update({ metadata: { phone, operator, gateway_transaction_id: gatewayTxnId } })
+          .eq("reference_id", transactionReference);
+        if (error) console.error("[MaishaPay] Could not store gateway transaction ID:", error.message);
+      }
 
       return res.json({
         success: true,
@@ -328,14 +787,19 @@ app.post("/api/maishapay/initiate-deposit", async (req, res) => {
     const fullError = errorTitle && errorDesc && !errorDesc.includes(errorTitle) ? `${errorTitle}: ${errorDesc}` : errorDesc;
 
     console.warn(`[MaishaPay Erreur API] ${fullError}`);
+    const { error: updateError } = await admin
+      .from("transactions")
+      .update({ status: "failed", description: fullError.slice(0, 500) })
+      .eq("reference_id", transactionReference)
+      .eq("status", "pending");
+    if (updateError) console.error("[MaishaPay] Could not record failed initiation:", updateError.message);
 
     return res.status(400).json({
       error: fullError,
-      details: data,
     });
   } catch (err: any) {
     console.error("[MaishaPay] Exception initiation :", err);
-    return res.status(500).json({ error: `Erreur serveur lors de l'appel MaishaPay: ${err.message || err}` });
+    return res.status(500).json({ error: err.message || "Erreur serveur lors de l'appel MaishaPay." });
   }
 });
 
@@ -347,58 +811,39 @@ app.get("/api/maishapay/check-status/:ref", async (req, res) => {
       return res.status(400).json({ error: "Référence requise." });
     }
 
-    const tx = activeTransactions.get(ref);
-    if (tx && tx.status === "completed") {
-      return res.json({ status: "completed", message: "Paiement validé avec succès !" });
-    }
-
-    const config = getMaishaPayConfig();
-    const payload = {
-      gatewayMode: config.mode,
-      publicApiKey: config.publicKey,
-      secretApiKey: config.secretKey,
-      transactionId: ref,
-    };
-
-    const result = await callMaishaPay(`${config.checkUrl}?useRef=1`, payload);
-    const data = result.data;
-    const statut = String(data?.status || data?.data?.status || data?.data?.statusDescription || "").toLowerCase();
-
-    if (["success", "completed", "paid", "approved"].includes(statut)) {
-      if (tx) tx.status = "completed";
-      return res.json({ status: "completed", message: "Paiement validé avec succès par l'opérateur !" });
-    }
-
-    if (["failed", "rejected", "canceled", "cancelled"].includes(statut)) {
-      if (tx) tx.status = "failed";
-      return res.json({ status: "failed", message: "Paiement refusé ou annulé sur votre téléphone." });
-    }
-
-    return res.json({ status: "pending_pin", message: "En attente de confirmation du code PIN sur votre téléphone." });
+    const user = await getAuthenticatedUser(req);
+    const result = await settleConfirmedDeposit(ref, user.id);
+    return res.json({
+      status: result.status,
+      ...(result.status === "completed" ? { message: "Paiement confirmé et enregistré." } : {}),
+      ...(result.status === "failed" ? { message: "Paiement refusé ou annulé." } : {}),
+      ...(result.status === "pending_pin" ? { message: "En attente de confirmation du code PIN sur votre téléphone." } : {}),
+    });
   } catch (err: any) {
     console.error("[MaishaPay Check Error]", err);
-    return res.json({ status: "pending_pin", message: "Vérification en cours..." });
+    return res.status(500).json({ error: err.message || "Erreur lors de la vérification MaishaPay." });
   }
 });
 
 // 3. Webhook de confirmation MaishaPay
-app.post("/api/maishapay/webhook", (req, res) => {
+app.post("/api/maishapay/webhook", async (req, res) => {
   try {
     const payload = req.body;
-    const ref = String(payload?.transaction_reference || payload?.transactionReference || payload?.reference || req.query.ref || "");
-    const status = String(payload?.status || payload?.transactionStatus || "").toLowerCase();
+    const ref = String(
+      payload?.transaction_reference
+        || payload?.transactionReference
+        || payload?.originatingTransactionId
+        || payload?.reference
+        || req.query.ref
+        || ""
+    );
+    if (!ref) return res.status(400).json({ error: "Transaction reference is required." });
 
-    console.log(`[MaishaPay Webhook] Réception notification Ref: ${ref} | Statut: ${status}`);
-
-    if (["success", "completed", "paid", "approved"].includes(status)) {
-      const tx = activeTransactions.get(ref);
-      if (tx) tx.status = "completed";
-      return res.status(200).json({ status: "processed", reference: ref });
-    }
-
-    return res.status(200).json({ status: "received", reference: ref });
+    const result = await settleConfirmedDeposit(ref);
+    return res.status(200).json({ status: result.status, reference: ref });
   } catch (err: any) {
-    return res.status(500).json({ error: "Erreur traitement webhook." });
+    console.error("[MaishaPay Webhook Error]", err);
+    return res.status(500).json({ error: "Could not reconcile the MaishaPay payment." });
   }
 });
 

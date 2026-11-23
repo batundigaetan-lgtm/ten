@@ -1,28 +1,8 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
-
-# Run and deploy your AI Studio app
-
-This contains everything you need to run your app locally.
-
-View your app in AI Studio: https://ai.studio/apps/00dd5115-89ac-4171-8299-030b8c761431
-
-## Run Locally
-
-**Prerequisites:**  Node.js
-
-
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
-
 ## MaishaPay Mobile Money
 
-- The React/Node payment endpoint is a local demo only. It simulates a payment in development and refuses real transactions; demo balances are stored only in the browser.
-- Real payments are handled by the PHP/MySQL flow (`dashboard.php`, `api_deposit.php`, and `maishapay_callback.php`). The server requires PHP with PDO MySQL and cURL, and the schema from `database.sql`.
-- Configure `.env` on the PHP host with the merchant keys, `MAISHAPAY_MODE=1`, and `APP_URL` set to the public HTTPS base URL that serves the PHP callback. The values in `.env.example` are placeholders.
-- `MAISHAPAY_MODE=0` is a no-payment sandbox: it does not call MaishaPay or credit a persistent wallet.
+- The React app uses the Node endpoints in `server.ts`. Deposit attempts are recorded in Supabase before MaishaPay is called; the wallet is credited only after the server verifies the final result with MaishaPay.
+- Apply `supabase_schema.sql` to the Supabase project before using the payment or withdrawal flows. The new-user trigger creates the profile, wallet, and welcome-bonus ledger records.
+- Configure the MaishaPay merchant keys, v2 collection/transfer URLs, `APP_URL`, and `SUPABASE_SERVICE_ROLE_KEY` in the Node server's `.env`. `APP_URL` must be the public HTTPS base URL that serves the Node callbacks. The service-role key must remain server-only: never prefix it with `VITE_` or expose it to the browser.
+- Withdrawals reserve the amount atomically in Supabase, send an Airtel Money B2C transfer through MaishaPay, and update the wallet only after the provider's final result is verified. Failed payouts release the reservation; unresolved payouts remain reserved and can be reconciled by callback or status polling.
+- The separate PHP/MySQL flow (`register.php`, `dashboard.php`, `api_deposit.php`, and `maishapay_callback.php`) uses `database.sql`; it is not the database path used by the React app.
 - Do not commit `.env` or expose merchant keys in client-side code.

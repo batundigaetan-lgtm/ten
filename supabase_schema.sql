@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS public.wallets (
   user_id UUID NOT NULL UNIQUE REFERENCES public.profiles(id) ON DELETE CASCADE,
   balance NUMERIC(15, 2) NOT NULL DEFAULT 0.00 CHECK (balance >= 0.00),
   available_balance_cdf NUMERIC(15, 2) NOT NULL DEFAULT 0.00 CHECK (available_balance_cdf >= 0.00),
+  locked_balance_cdf NUMERIC(15, 2) NOT NULL DEFAULT 0.00 CHECK (locked_balance_cdf >= 0.00),
   currency TEXT NOT NULL DEFAULT 'CDF',
   total_deposited NUMERIC(15, 2) NOT NULL DEFAULT 0.00 CHECK (total_deposited >= 0.00),
   total_withdrawn NUMERIC(15, 2) NOT NULL DEFAULT 0.00 CHECK (total_withdrawn >= 0.00),
@@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS public.wallets (
 );
 
 ALTER TABLE public.wallets ADD COLUMN IF NOT EXISTS available_balance_cdf NUMERIC(15, 2) NOT NULL DEFAULT 0.00;
+ALTER TABLE public.wallets ADD COLUMN IF NOT EXISTS locked_balance_cdf NUMERIC(15, 2) NOT NULL DEFAULT 0.00 CHECK (locked_balance_cdf >= 0.00);
 
 CREATE INDEX IF NOT EXISTS idx_wallets_user_id ON public.wallets(user_id);
 
@@ -60,8 +62,56 @@ CREATE TABLE IF NOT EXISTS public.transactions (
 
 CREATE INDEX IF NOT EXISTS idx_transactions_user_id ON public.transactions(user_id);
 CREATE INDEX IF NOT EXISTS idx_transactions_status ON public.transactions(status);
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM public.transactions
+    WHERE reference_id IS NOT NULL
+    GROUP BY reference_id
+    HAVING COUNT(*) > 1
+  ) THEN
+    RAISE EXCEPTION 'Duplicate transactions.reference_id values must be resolved before applying payment idempotency.';
+  END IF;
+END;
+$$;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_reference_id_unique
+  ON public.transactions(reference_id)
+  WHERE reference_id IS NOT NULL;
 
--- 5. TABLE WITHDRAWAL REQUESTS (Retraits soumis à validation manuelle stricte)
+-- 4a. GRAND LIVRE FINANCIER
+CREATE TABLE IF NOT EXISTS public.ledger_entries (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  transaction_id UUID REFERENCES public.transactions(id) ON DELETE SET NULL,
+  wallet_id UUID NOT NULL REFERENCES public.wallets(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  entry_type TEXT NOT NULL CHECK (entry_type IN ('debit', 'credit')),
+  amount NUMERIC(15, 2) NOT NULL CHECK (amount > 0.00),
+  balance_after NUMERIC(15, 2) NOT NULL CHECK (balance_after >= 0.00),
+  description TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
+);
+
+CREATE INDEX IF NOT EXISTS idx_ledger_entries_user_created
+  ON public.ledger_entries(user_id, created_at DESC);
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM public.ledger_entries
+    WHERE transaction_id IS NOT NULL
+    GROUP BY transaction_id
+    HAVING COUNT(*) > 1
+  ) THEN
+    RAISE EXCEPTION 'Duplicate ledger_entries.transaction_id values must be resolved before applying payment idempotency.';
+  END IF;
+END;
+$$;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_entries_transaction_unique
+  ON public.ledger_entries(transaction_id)
+  WHERE transaction_id IS NOT NULL;
+
+-- 5. TABLE WITHDRAWAL REQUESTS (Réservations et transferts MaishaPay)
 CREATE TABLE IF NOT EXISTS public.withdrawal_requests (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
@@ -73,10 +123,13 @@ CREATE TABLE IF NOT EXISTS public.withdrawal_requests (
   destination_phone TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'processed')),
   rejection_reason TEXT,
+  provider_transaction_id TEXT,
   admin_id UUID REFERENCES public.profiles(id),
   processed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
+
+ALTER TABLE public.withdrawal_requests ADD COLUMN IF NOT EXISTS provider_transaction_id TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_withdrawals_user_id ON public.withdrawal_requests(user_id);
 CREATE INDEX IF NOT EXISTS idx_withdrawals_status ON public.withdrawal_requests(status);
@@ -121,6 +174,7 @@ CREATE INDEX IF NOT EXISTS idx_daily_earnings_user_date ON public.daily_earnings
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.wallets ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.ledger_entries ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.withdrawal_requests ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.investments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.daily_earnings ENABLE ROW LEVEL SECURITY;
@@ -129,10 +183,12 @@ ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS is_activated BOOLEAN NOT NU
 ALTER TABLE public.profiles ADD COLUMN IF NOT EXISTS welcome_bonus_claimed BOOLEAN NOT NULL DEFAULT false;
 
 -- 1. Profiles : Lecture et mise à jour limitée (nom, téléphone) par le titulaire
+DROP POLICY IF EXISTS "profiles_select_own" ON public.profiles;
 CREATE POLICY "profiles_select_own"
   ON public.profiles FOR SELECT
   USING (auth.uid() = id);
 
+DROP POLICY IF EXISTS "profiles_update_own" ON public.profiles;
 CREATE POLICY "profiles_update_own"
   ON public.profiles FOR UPDATE
   USING (auth.uid() = id)
@@ -144,6 +200,7 @@ CREATE POLICY "profiles_update_own"
   );
 
 -- 2. Wallets : Lecture seule pour l'utilisateur. INTERDICTION STRICTE DE MODIFIER LE SOLDE
+DROP POLICY IF EXISTS "wallets_select_own" ON public.wallets;
 CREATE POLICY "wallets_select_own"
   ON public.wallets FOR SELECT
   USING (auth.uid() = user_id);
@@ -152,33 +209,27 @@ CREATE POLICY "wallets_select_own"
 -- Seul le déclencheur SECURITY DEFINER ou le backend avec privilèges de service peut modifier 'wallets'.
 
 -- 3. Transactions : Lecture seule de ses propres transactions
+DROP POLICY IF EXISTS "transactions_select_own" ON public.transactions;
 CREATE POLICY "transactions_select_own"
   ON public.transactions FOR SELECT
   USING (auth.uid() = user_id);
 
 -- 4. Withdrawal Requests : Création d'une demande et consultation de son statut
 -- Règle 3 : Aucun retrait si le compte n'est pas activé, montant minimum 5 000 FC
+DROP POLICY IF EXISTS "withdrawals_select_own" ON public.withdrawal_requests;
 CREATE POLICY "withdrawals_select_own"
   ON public.withdrawal_requests FOR SELECT
   USING (auth.uid() = user_id);
 
-CREATE POLICY "withdrawals_insert_own"
-  ON public.withdrawal_requests FOR INSERT
-  WITH CHECK (
-    auth.uid() = user_id 
-    AND status = 'pending'
-    AND amount >= 5000.00
-    AND EXISTS (
-      SELECT 1 FROM public.profiles 
-      WHERE id = auth.uid() AND is_activated = true
-    )
-  );
+DROP POLICY IF EXISTS "withdrawals_insert_own" ON public.withdrawal_requests;
 
 -- 5. Investments & Daily Earnings : Lecture seule par le titulaire
+DROP POLICY IF EXISTS "investments_select_own" ON public.investments;
 CREATE POLICY "investments_select_own"
   ON public.investments FOR SELECT
   USING (auth.uid() = user_id);
 
+DROP POLICY IF EXISTS "daily_earnings_select_own" ON public.daily_earnings;
 CREATE POLICY "daily_earnings_select_own"
   ON public.daily_earnings FOR SELECT
   USING (auth.uid() = user_id);
@@ -198,7 +249,7 @@ AS $$
 DECLARE
   gen_referral TEXT;
   v_wallet_id UUID;
-  v_bonus_already_claimed BOOLEAN := false;
+  v_transaction_id UUID;
 BEGIN
   gen_referral := COALESCE(
     NEW.raw_user_meta_data->>'referral_code',
@@ -242,6 +293,7 @@ BEGIN
       user_id,
       balance,
       available_balance_cdf,
+      locked_balance_cdf,
       currency,
       total_deposited,
       total_withdrawn,
@@ -252,6 +304,7 @@ BEGIN
       NEW.id,
       2000.00, -- Bonus de bienvenue crédité de manière atomique
       2000.00, -- Crédité directement dans available_balance_cdf
+      0.00,
       'CDF',
       0.00,    -- Ne provient PAS d'un dépôt
       0.00,
@@ -260,25 +313,7 @@ BEGIN
     )
     RETURNING id INTO v_wallet_id;
 
-    -- 3. Enregistrement unique dans 'ledger_entries'
-    INSERT INTO public.ledger_entries (
-      wallet_id,
-      user_id,
-      entry_type,
-      amount,
-      balance_after,
-      description
-    )
-    VALUES (
-      v_wallet_id,
-      NEW.id,
-      'credit',
-      2000.00,
-      2000.00,
-      'Bonus de bienvenue RentTech Hub'
-    );
-
-    -- 4. Enregistrement correspondant dans 'transactions'
+    -- 3. Enregistrement correspondant dans 'transactions'
     INSERT INTO public.transactions (
       wallet_id,
       user_id,
@@ -298,6 +333,27 @@ BEGIN
       'completed',
       'Bonus de bienvenue RentTech Hub',
       'system_welcome_bonus'
+    )
+    RETURNING id INTO v_transaction_id;
+
+    -- 4. Écriture unique dans le grand livre
+    INSERT INTO public.ledger_entries (
+      transaction_id,
+      wallet_id,
+      user_id,
+      entry_type,
+      amount,
+      balance_after,
+      description
+    )
+    VALUES (
+      v_transaction_id,
+      v_wallet_id,
+      NEW.id,
+      'credit',
+      2000.00,
+      2000.00,
+      'Bonus de bienvenue RentTech Hub'
     );
   END IF;
 
@@ -332,62 +388,74 @@ SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
 DECLARE
+  v_transaction_id UUID;
   v_wallet_id UUID;
-  v_old_balance NUMERIC;
-  v_new_balance NUMERIC;
+  v_tx_user_id UUID;
+  v_tx_amount NUMERIC;
+  v_tx_status TEXT;
+  v_balance NUMERIC;
+  v_available NUMERIC;
 BEGIN
-  -- Verrouillage exclusif de la ligne portefeuille
-  SELECT id, COALESCE(available_balance_cdf, balance, 0.00) INTO v_wallet_id, v_old_balance
-  FROM public.wallets
-  WHERE user_id = p_user_id
+  IF p_user_id IS NULL OR p_amount IS NULL OR p_amount <= 0.00 OR p_reference IS NULL OR btrim(p_reference) = '' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Montant ou référence de dépôt invalide.');
+  END IF;
+
+  -- The provider reference is persisted before the payment is initiated.
+  SELECT id, user_id, wallet_id, amount, status
+  INTO v_transaction_id, v_tx_user_id, v_wallet_id, v_tx_amount, v_tx_status
+  FROM public.transactions
+  WHERE reference_id = p_reference AND type = 'deposit'
   FOR UPDATE;
 
-  IF v_wallet_id IS NULL THEN
+  IF v_transaction_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Transaction de dépôt introuvable.');
+  END IF;
+  IF v_tx_user_id <> p_user_id OR v_tx_amount <> p_amount THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Les données du dépôt ne correspondent pas à la transaction.');
+  END IF;
+
+  IF v_tx_status = 'completed' THEN
+    SELECT balance INTO v_balance FROM public.wallets WHERE id = v_wallet_id;
+    RETURN jsonb_build_object('success', true, 'new_balance', v_balance, 'is_activated', true);
+  END IF;
+  IF v_tx_status <> 'pending' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Cette transaction de dépôt ne peut plus être créditée.');
+  END IF;
+
+  -- Lock the wallet row so concurrent confirmations cannot lose a credit.
+  SELECT balance, available_balance_cdf
+  INTO v_balance, v_available
+  FROM public.wallets
+  WHERE id = v_wallet_id AND user_id = p_user_id
+  FOR UPDATE;
+
+  IF v_balance IS NULL THEN
     RETURN jsonb_build_object('success', false, 'error', 'Portefeuille introuvable.');
   END IF;
 
-  v_new_balance := v_old_balance + p_amount;
+  v_balance := v_balance + p_amount;
+  v_available := v_available + p_amount;
 
-  -- 1. Crédit atomique du solde et mise à jour du total déposé
   UPDATE public.wallets
-  SET balance = v_new_balance,
-      available_balance_cdf = v_new_balance,
+  SET balance = v_balance,
+      available_balance_cdf = v_available,
       total_deposited = total_deposited + p_amount,
       updated_at = timezone('utc'::text, now())
   WHERE id = v_wallet_id;
 
-  -- 2. Activation automatique du compte (Règle 8 : Activé une seule fois, idempotent)
   UPDATE public.profiles
   SET is_activated = true,
       updated_at = timezone('utc'::text, now())
   WHERE id = p_user_id AND is_activated = false;
 
-  -- 3. Enregistrement transaction
-  INSERT INTO public.transactions (
-    wallet_id,
-    user_id,
-    type,
-    amount,
-    fee,
-    status,
-    reference_id,
-    description,
-    payment_method
-  )
-  VALUES (
-    v_wallet_id,
-    p_user_id,
-    'deposit',
-    p_amount,
-    0.00,
-    'completed',
-    p_reference,
-    'Dépôt confirmé MaishaPay - Compte Activé',
-    p_payment_method
-  );
+  UPDATE public.transactions
+  SET status = 'completed',
+      description = 'Dépôt confirmé MaishaPay - Compte Activé',
+      payment_method = p_payment_method
+  WHERE id = v_transaction_id;
 
-  -- 4. Écriture dans ledger_entries
   INSERT INTO public.ledger_entries (
+    transaction_id,
     wallet_id,
     user_id,
     entry_type,
@@ -396,17 +464,18 @@ BEGIN
     description
   )
   VALUES (
+    v_transaction_id,
     v_wallet_id,
     p_user_id,
     'credit',
     p_amount,
-    v_new_balance,
+    v_balance,
     'Dépôt validé MaishaPay - Activation du compte'
   );
 
   RETURN jsonb_build_object(
     'success', true,
-    'new_balance', v_new_balance,
+    'new_balance', v_balance,
     'is_activated', true
   );
 END;
@@ -421,7 +490,9 @@ GRANT EXECUTE ON FUNCTION public.confirm_deposit_and_activate(UUID, NUMERIC, TEX
 -- Le bonus de 2 000 FC est strictement exclu du montant retirable
 -- =========================================================================
 
+DROP FUNCTION IF EXISTS public.submit_withdrawal_request(UUID, NUMERIC, TEXT, TEXT);
 CREATE OR REPLACE FUNCTION public.submit_withdrawal_request(
+  p_request_id UUID,
   p_user_id UUID,
   p_amount NUMERIC,
   p_destination_phone TEXT,
@@ -435,12 +506,53 @@ AS $$
 DECLARE
   v_wallet_id UUID;
   v_avail_bal NUMERIC;
+  v_locked_bal NUMERIC;
   v_is_locked BOOLEAN;
   v_is_activated BOOLEAN;
-  v_pending_sum NUMERIC := 0.00;
   v_withdrawable NUMERIC;
   v_new_req_id UUID;
+  v_existing_user UUID;
+  v_existing_amount NUMERIC;
+  v_existing_phone TEXT;
+  v_existing_status TEXT;
 BEGIN
+  IF p_request_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Référence de demande requise.');
+  END IF;
+  IF auth.uid() IS DISTINCT FROM p_user_id AND COALESCE(auth.role(), '') <> 'service_role' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Utilisateur non autorisé.');
+  END IF;
+  IF p_amount IS NULL OR p_destination_phone IS NULL OR btrim(p_destination_phone) = '' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Montant ou numéro de destination invalide.');
+  END IF;
+
+  SELECT user_id, amount, destination_phone, status
+  INTO v_existing_user, v_existing_amount, v_existing_phone, v_existing_status
+  FROM public.withdrawal_requests
+  WHERE id = p_request_id
+  FOR UPDATE;
+
+  IF FOUND THEN
+    IF v_existing_user <> p_user_id OR v_existing_amount <> p_amount OR v_existing_phone <> p_destination_phone THEN
+      RETURN jsonb_build_object('success', false, 'error', 'La référence de retrait existe déjà avec des données différentes.');
+    END IF;
+
+    SELECT available_balance_cdf, locked_balance_cdf
+    INTO v_avail_bal, v_locked_bal
+    FROM public.wallets
+    WHERE user_id = p_user_id;
+
+    RETURN jsonb_build_object(
+      'success', true,
+      'request_id', p_request_id,
+      'amount', p_amount,
+      'available_balance_cdf', v_avail_bal,
+      'locked_balance_cdf', v_locked_bal,
+      'status', v_existing_status,
+      'already_exists', true
+    );
+  END IF;
+
   -- 1. Vérification du statut d'activation du compte
   SELECT is_activated INTO v_is_activated
   FROM public.profiles
@@ -458,13 +570,13 @@ BEGIN
   END IF;
 
   -- 2. Montant minimum de 5 000 FC
-  IF p_amount < 5000.00 THEN
+  IF p_amount < 5000.00 OR p_amount <> trunc(p_amount) THEN
     RETURN jsonb_build_object('success', false, 'error', 'Le montant minimum de retrait est de 5 000 FC.');
   END IF;
 
-  -- 3. Verrouillage transactionnel FOR UPDATE du portefeuille (protection atomique anti-concurrence)
-  SELECT id, COALESCE(available_balance_cdf, balance, 0.00), is_locked
-  INTO v_wallet_id, v_avail_bal, v_is_locked
+  -- Locking the wallet row serializes reservations and prevents double spending.
+  SELECT id, available_balance_cdf, locked_balance_cdf, is_locked
+  INTO v_wallet_id, v_avail_bal, v_locked_bal, v_is_locked
   FROM public.wallets
   WHERE user_id = p_user_id
   FOR UPDATE;
@@ -477,24 +589,26 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'Ce portefeuille est temporairement verrouillé pour contrôle de sécurité.');
   END IF;
 
-  -- 4. Somme atomique des retraits en cours de traitement ('pending')
-  SELECT COALESCE(SUM(amount), 0.00)
-  INTO v_pending_sum
-  FROM public.withdrawal_requests
-  WHERE user_id = p_user_id AND status = 'pending';
-
-  -- 5. Calcul strict du solde retirable (exclusion définitive du bonus 2 000 FC + déduction des retraits en attente)
-  v_withdrawable := GREATEST(0.00, v_avail_bal - 2000.00 - v_pending_sum);
+  -- The welcome bonus remains in the available balance but is not withdrawable.
+  v_withdrawable := GREATEST(0.00, v_avail_bal - 2000.00);
 
   IF p_amount > v_withdrawable THEN
     RETURN jsonb_build_object(
       'success', false,
-      'error', format('Solde retirable insuffisant (%s FC disponibles). Le bonus de bienvenue de 2 000 FC est réservé à l''investissement locatif et les demandes en cours sont déduites.', v_withdrawable)
+      'error', format('Solde retirable insuffisant (%s FC disponibles). Le bonus de bienvenue de 2 000 FC est réservé à l''investissement locatif.', v_withdrawable)
     );
   END IF;
 
-  -- 6. Enregistrement atomique de la demande en statut 'pending'
+  UPDATE public.wallets
+  SET available_balance_cdf = available_balance_cdf - p_amount,
+      locked_balance_cdf = locked_balance_cdf + p_amount,
+      updated_at = timezone('utc'::text, now())
+  WHERE id = v_wallet_id
+  RETURNING available_balance_cdf, locked_balance_cdf
+  INTO v_avail_bal, v_locked_bal;
+
   INSERT INTO public.withdrawal_requests (
+    id,
     user_id,
     wallet_id,
     amount,
@@ -505,6 +619,7 @@ BEGIN
     status
   )
   VALUES (
+    p_request_id,
     p_user_id,
     v_wallet_id,
     p_amount,
@@ -520,12 +635,154 @@ BEGIN
     'success', true,
     'request_id', v_new_req_id,
     'amount', p_amount,
-    'withdrawable_balance_remaining', v_withdrawable - p_amount
+    'available_balance_cdf', v_avail_bal,
+    'locked_balance_cdf', v_locked_bal,
+    'status', 'pending',
+    'already_exists', false
   );
 END;
 $$;
 
-REVOKE ALL ON FUNCTION public.submit_withdrawal_request(UUID, NUMERIC, TEXT, TEXT) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.submit_withdrawal_request(UUID, NUMERIC, TEXT, TEXT) TO authenticated, service_role;
+REVOKE ALL ON FUNCTION public.submit_withdrawal_request(UUID, UUID, NUMERIC, TEXT, TEXT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.submit_withdrawal_request(UUID, UUID, NUMERIC, TEXT, TEXT) TO authenticated, service_role;
+
+DROP FUNCTION IF EXISTS public.finalize_withdrawal_request(UUID, BOOLEAN, TEXT, TEXT);
+CREATE OR REPLACE FUNCTION public.finalize_withdrawal_request(
+  p_request_id UUID,
+  p_success BOOLEAN,
+  p_reference TEXT DEFAULT NULL,
+  p_error TEXT DEFAULT NULL,
+  p_provider_transaction_id TEXT DEFAULT NULL
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_user_id UUID;
+  v_wallet_id UUID;
+  v_amount NUMERIC;
+  v_payment_method TEXT;
+  v_status TEXT;
+  v_balance NUMERIC;
+  v_locked_balance NUMERIC;
+  v_transaction_id UUID;
+BEGIN
+  IF COALESCE(auth.role(), '') <> 'service_role' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Opération réservée au serveur de paiement.');
+  END IF;
+  IF p_success IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Résultat du paiement manquant.');
+  END IF;
+
+  SELECT user_id, wallet_id, amount, payment_method, status
+  INTO v_user_id, v_wallet_id, v_amount, v_payment_method, v_status
+  FROM public.withdrawal_requests
+  WHERE id = p_request_id
+  FOR UPDATE;
+
+  IF v_user_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Demande de retrait introuvable.');
+  END IF;
+  IF v_status = 'processed' THEN
+    RETURN jsonb_build_object('success', true, 'status', 'processed');
+  END IF;
+  IF v_status = 'rejected' THEN
+    RETURN jsonb_build_object('success', true, 'status', 'rejected');
+  END IF;
+  IF v_status <> 'pending' OR v_wallet_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Cette demande ne peut pas être finalisée.');
+  END IF;
+
+  SELECT balance, locked_balance_cdf
+  INTO v_balance, v_locked_balance
+  FROM public.wallets
+  WHERE id = v_wallet_id AND user_id = v_user_id
+  FOR UPDATE;
+
+  IF v_balance IS NULL OR v_locked_balance < v_amount THEN
+    RETURN jsonb_build_object('success', false, 'error', 'Le montant réservé du portefeuille ne correspond pas à la demande.');
+  END IF;
+
+  IF p_success THEN
+    IF p_reference IS NULL OR btrim(p_reference) = '' THEN
+      RETURN jsonb_build_object('success', false, 'error', 'La référence MaishaPay est obligatoire pour un paiement confirmé.');
+    END IF;
+
+    UPDATE public.wallets
+    SET balance = balance - v_amount,
+        locked_balance_cdf = locked_balance_cdf - v_amount,
+        total_withdrawn = total_withdrawn + v_amount,
+        updated_at = timezone('utc'::text, now())
+    WHERE id = v_wallet_id
+    RETURNING balance INTO v_balance;
+
+    UPDATE public.withdrawal_requests
+    SET status = 'processed',
+        provider_transaction_id = COALESCE(p_provider_transaction_id, provider_transaction_id),
+        processed_at = timezone('utc'::text, now())
+    WHERE id = p_request_id;
+
+    INSERT INTO public.transactions (
+      wallet_id, user_id, type, amount, fee, status, reference_id,
+      description, payment_method, metadata
+    )
+    VALUES (
+      v_wallet_id, v_user_id, 'withdrawal', v_amount, 0.00, 'completed', p_reference,
+      'Retrait confirmé par MaishaPay', v_payment_method,
+      jsonb_build_object(
+        'withdrawal_request_id', p_request_id,
+        'provider_transaction_id', p_provider_transaction_id
+      )
+    )
+    RETURNING id INTO v_transaction_id;
+
+    INSERT INTO public.ledger_entries (
+      transaction_id, wallet_id, user_id, entry_type, amount, balance_after, description
+    )
+    VALUES (
+      v_transaction_id, v_wallet_id, v_user_id, 'debit', v_amount, v_balance,
+      'Retrait confirmé par MaishaPay'
+    );
+  ELSE
+    UPDATE public.wallets
+    SET available_balance_cdf = available_balance_cdf + v_amount,
+        locked_balance_cdf = locked_balance_cdf - v_amount,
+        updated_at = timezone('utc'::text, now())
+    WHERE id = v_wallet_id;
+
+    UPDATE public.withdrawal_requests
+    SET status = 'rejected',
+        rejection_reason = COALESCE(NULLIF(p_error, ''), 'Paiement refusé par MaishaPay'),
+        provider_transaction_id = COALESCE(p_provider_transaction_id, provider_transaction_id),
+        processed_at = timezone('utc'::text, now())
+    WHERE id = p_request_id;
+
+    INSERT INTO public.transactions (
+      wallet_id, user_id, type, amount, fee, status, reference_id,
+      description, payment_method, metadata
+    )
+    VALUES (
+      v_wallet_id, v_user_id, 'withdrawal', v_amount, 0.00, 'failed',
+      COALESCE(NULLIF(p_reference, ''), 'withdrawal-failed-' || p_request_id::TEXT),
+      COALESCE(NULLIF(p_error, ''), 'Retrait refusé par MaishaPay'),
+      v_payment_method,
+      jsonb_build_object(
+        'withdrawal_request_id', p_request_id,
+        'provider_transaction_id', p_provider_transaction_id
+      )
+    );
+  END IF;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'status', CASE WHEN p_success THEN 'processed' ELSE 'rejected' END
+  );
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.finalize_withdrawal_request(UUID, BOOLEAN, TEXT, TEXT, TEXT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.finalize_withdrawal_request(UUID, BOOLEAN, TEXT, TEXT, TEXT) TO service_role;
 
 

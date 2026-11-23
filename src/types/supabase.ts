@@ -193,6 +193,7 @@ export interface Database {
           user_id: string;
           balance: number;
           available_balance_cdf: number;
+          locked_balance_cdf: number;
           currency: string;
           total_deposited: number;
           total_withdrawn: number;
@@ -206,6 +207,7 @@ export interface Database {
           user_id: string;
           balance?: number;
           available_balance_cdf?: number;
+          locked_balance_cdf?: number;
           currency?: string;
           total_deposited?: number;
           total_withdrawn?: number;
@@ -219,6 +221,7 @@ export interface Database {
           user_id?: string;
           balance?: number;
           available_balance_cdf?: number;
+          locked_balance_cdf?: number;
           currency?: string;
           total_deposited?: number;
           total_withdrawn?: number;
@@ -359,6 +362,7 @@ export interface Database {
           destination_phone: string;
           status: 'pending' | 'approved' | 'rejected' | 'processed';
           rejection_reason: string | null;
+          provider_transaction_id: string | null;
           admin_id: string | null;
           processed_at: string | null;
           created_at: string;
@@ -374,6 +378,7 @@ export interface Database {
           destination_phone: string;
           status?: 'pending' | 'approved' | 'rejected' | 'processed';
           rejection_reason?: string | null;
+          provider_transaction_id?: string | null;
           admin_id?: string | null;
           processed_at?: string | null;
           created_at?: string;
@@ -389,6 +394,7 @@ export interface Database {
           destination_phone?: string;
           status?: 'pending' | 'approved' | 'rejected' | 'processed';
           rejection_reason?: string | null;
+          provider_transaction_id?: string | null;
           admin_id?: string | null;
           processed_at?: string | null;
           created_at?: string;
@@ -511,7 +517,53 @@ export interface Database {
       [_ in never]: never;
     };
     Functions: {
-      [_ in never]: never;
+      confirm_deposit_and_activate: {
+        Args: {
+          p_user_id: string;
+          p_amount: number;
+          p_reference: string;
+          p_payment_method?: string;
+        };
+        Returns: {
+          success: boolean;
+          error?: string;
+          new_balance?: number;
+          is_activated?: boolean;
+        };
+      };
+      submit_withdrawal_request: {
+        Args: {
+          p_request_id: string;
+          p_user_id: string;
+          p_amount: number;
+          p_destination_phone: string;
+          p_payment_method?: string;
+        };
+        Returns: {
+          success: boolean;
+          error?: string;
+          request_id?: string;
+          amount?: number;
+          available_balance_cdf?: number;
+          locked_balance_cdf?: number;
+          status?: string;
+          already_exists?: boolean;
+        };
+      };
+      finalize_withdrawal_request: {
+        Args: {
+          p_request_id: string;
+          p_success: boolean;
+          p_reference?: string;
+          p_error?: string;
+          p_provider_transaction_id?: string;
+        };
+        Returns: {
+          success: boolean;
+          error?: string;
+          status?: string;
+        };
+      };
     };
     Enums: {
       [_ in never]: never;

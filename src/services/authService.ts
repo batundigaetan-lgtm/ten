@@ -128,22 +128,34 @@ export const authService = {
       const userId = data.user.id;
 
       // Lecture du profil
-      const { data: profileData } = await supabase
+      const { data: profileData, error: profileError } = await supabase
         .from('profiles')
         .select('*')
         .eq('id', userId)
         .maybeSingle();
 
+      if (profileError) {
+        return { success: false, error: `Impossible de lire le profil Supabase : ${profileError.message}` };
+      }
       const profile = profileData as Profile | null;
+      if (!profile) {
+        return { success: false, error: 'Le profil Supabase de ce compte n’a pas été initialisé.' };
+      }
 
       // Lecture du portefeuille réel depuis la table 'wallets'
-      const { data: walletData } = await supabase
+      const { data: walletData, error: walletError } = await supabase
         .from('wallets')
         .select('*')
         .eq('user_id', userId)
         .maybeSingle();
 
+      if (walletError) {
+        return { success: false, error: `Impossible de lire le portefeuille Supabase : ${walletError.message}` };
+      }
       const wallet = walletData as Wallet | null;
+      if (!wallet) {
+        return { success: false, error: 'Le portefeuille Supabase de ce compte n’a pas été initialisé.' };
+      }
 
       return {
         success: true,
@@ -154,9 +166,9 @@ export const authService = {
           phone: profile?.phone || data.user.user_metadata?.phone || '',
           role: profile?.role || 'user',
           referralCode: profile?.referral_code || 'RT892X4',
-          balance: Number(wallet?.available_balance_cdf ?? wallet?.balance ?? (profile?.welcome_bonus_claimed ? 2000 : 0)),
-          totalInvested: Number(wallet?.total_deposited || 0),
-          totalEarned: Number(wallet?.total_earned || 0),
+          balance: Number(wallet.available_balance_cdf ?? wallet.balance),
+          totalInvested: Number(wallet.total_deposited || 0),
+          totalEarned: Number(wallet.total_earned || 0),
           isActivated: Boolean(profile?.is_activated),
           welcomeBonusClaimed: Boolean(profile?.welcome_bonus_claimed),
         },

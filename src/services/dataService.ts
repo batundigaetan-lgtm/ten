@@ -169,12 +169,21 @@ export const dataService = {
   // - Protection transactionnelle anti-concurrence (FOR UPDATE / RPC)
   // ==========================================
   async requestWithdrawal(params: {
-    userId: string;
-    walletId?: string;
+    requestId: string;
     amount: number;
     destinationPhone: string;
     paymentMethod?: string;
-  }): Promise<{ success: boolean; data?: WithdrawalRequestRow; error?: string }> {
+  }): Promise<{
+    success: boolean;
+    data?: {
+      requestId: string;
+      status: 'pending' | 'processed' | 'rejected';
+      availableBalance: number;
+      lockedBalance: number;
+      providerTransactionId?: string;
+    };
+    error?: string;
+  }> {
     // 1. Règle 3 : Retrait minimum de 5 000 FC
     if (params.amount < 5000) {
       return { success: false, error: 'Le montant minimum de retrait est de 5 000 FC.' };
@@ -185,106 +194,102 @@ export const dataService = {
     }
 
     try {
-      // 2. Règle 5 : Tentative d'exécution de la fonction PostgreSQL transactionnelle sécurisée (submit_withdrawal_request)
-      try {
-        const { data: rpcData, error: rpcError } = await (supabase.rpc as any)('submit_withdrawal_request', {
-          p_user_id: params.userId,
-          p_amount: params.amount,
-          p_destination_phone: params.destinationPhone,
-          p_payment_method: params.paymentMethod || 'airtel_money',
-        });
-
-        if (!rpcError && rpcData) {
-          const resObj = typeof rpcData === 'string' ? JSON.parse(rpcData) : rpcData;
-          if (!resObj.success) {
-            return { success: false, error: resObj.error || 'Erreur lors de la soumission du retrait.' };
-          }
-          return {
-            success: true,
-            data: {
-              id: resObj.request_id || `REQ-${Date.now()}`,
-              user_id: params.userId,
-              wallet_id: params.walletId || null,
-              amount: params.amount,
-              fee: 0,
-              net_amount: params.amount,
-              destination_phone: params.destinationPhone,
-              payment_method: params.paymentMethod || 'airtel_money',
-              status: 'pending',
-              rejection_reason: null,
-              admin_id: null,
-              processed_at: null,
-              created_at: new Date().toISOString(),
-            },
-          };
-        }
-      } catch (rpcEx) {
-        console.warn('[Supabase] RPC submit_withdrawal_request indisponible, bascule sur contrôle direct :', rpcEx);
+      const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError || !sessionData.session?.access_token) {
+        return { success: false, error: sessionError?.message || 'Session Supabase introuvable.' };
       }
 
-      // 3. Fallback direct avec vérifications strictes :
-      const profile = await this.getProfile(params.userId);
-      if (!profile?.is_activated) {
-        return {
-          success: false,
-          error: "Droit de retrait bloqué : Votre compte est en attente d'activation. Effectuez votre premier dépôt pour activer votre compte et débloquer les retraits.",
-        };
-      }
-
-      const wallet = await this.getWallet(params.userId);
-      if (!wallet) {
-        return { success: false, error: 'Portefeuille introuvable.' };
-      }
-
-      if (wallet.is_locked) {
-        return { success: false, error: 'Ce portefeuille est temporairement verrouillé pour contrôle de sécurité.' };
-      }
-
-      // 4. Règle 3 : Le bonus de bienvenue (2 000 FC) ne peut être retiré directement
-      const actualBalance = Number(wallet.available_balance_cdf ?? wallet.balance ?? 0);
-      const withdrawableBalance = Math.max(0, actualBalance - 2000);
-
-      // 5. Protection anti-doubles retraits / requêtes simultanées
-      const { data: pendingRequests, error: pendingErr } = await supabase
-        .from('withdrawal_requests')
-        .select('amount')
-        .eq('user_id', params.userId)
-        .eq('status', 'pending');
-
-      const pendingSum = (!pendingErr && pendingRequests)
-        ? pendingRequests.reduce((sum, r) => sum + Number(r.amount || 0), 0)
-        : 0;
-
-      if (params.amount > (withdrawableBalance - pendingSum)) {
-        return {
-          success: false,
-          error: `Solde retirable insuffisant (${Math.max(0, withdrawableBalance - pendingSum).toLocaleString('fr-FR')} FC disponibles). Le bonus de bienvenue de 2 000 FC est réservé et les demandes en attente sont déduites.`,
-        };
-      }
-
-      // 6. Enregistrement en statut 'pending' obligatoire (aucune validation automatique)
-      const { data, error } = await supabase
-        .from('withdrawal_requests')
-        .insert({
-          user_id: params.userId,
-          wallet_id: wallet.id,
+      const response = await fetch('/api/maishapay/initiate-withdrawal', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sessionData.session.access_token}`,
+        },
+        body: JSON.stringify({
+          requestId: params.requestId,
           amount: params.amount,
-          fee: 0,
-          net_amount: params.amount,
-          destination_phone: params.destinationPhone,
-          payment_method: params.paymentMethod || 'airtel_money',
-          status: 'pending',
-        } as any)
-        .select()
-        .single();
+          phone: params.destinationPhone,
+          paymentMethod: params.paymentMethod || 'airtel_money',
+        }),
+      });
 
-      if (error) {
-        return { success: false, error: error.message };
+      const result = await response.json();
+      if (!response.ok || result.error) {
+        return { success: false, error: result.error || 'Échec de la demande de retrait MaishaPay.' };
+      }
+      if (!result.requestId || !['pending', 'processed', 'rejected'].includes(result.status)) {
+        return { success: false, error: 'Le serveur a retourné un état de retrait invalide.' };
+      }
+      const availableBalance = Number(result.availableBalance);
+      const lockedBalance = Number(result.lockedBalance);
+      if (!Number.isFinite(availableBalance) || !Number.isFinite(lockedBalance)) {
+        return { success: false, error: 'Le serveur a retourné un solde de retrait invalide.' };
       }
 
-      return { success: true, data: data as WithdrawalRequestRow };
+      return {
+        success: true,
+        data: {
+          requestId: result.requestId,
+          status: result.status,
+          availableBalance,
+          lockedBalance,
+          providerTransactionId: result.providerTransactionId,
+        },
+      };
     } catch (err: any) {
       return { success: false, error: err?.message || 'Erreur lors de la soumission du retrait.' };
+    }
+  },
+
+  async getWithdrawalStatus(requestId: string): Promise<{
+    success: boolean;
+    data?: {
+      requestId: string;
+      status: 'pending' | 'processed' | 'rejected';
+      availableBalance: number;
+      lockedBalance: number;
+      providerTransactionId?: string;
+    };
+    error?: string;
+  }> {
+    if (!isSupabaseConfigured()) {
+      return { success: false, error: 'Connexion Supabase non configurée.' };
+    }
+
+    try {
+      const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError || !sessionData.session?.access_token) {
+        return { success: false, error: sessionError?.message || 'Session Supabase introuvable.' };
+      }
+
+      const response = await fetch(`/api/maishapay/withdrawal-status/${encodeURIComponent(requestId)}`, {
+        headers: { Authorization: `Bearer ${sessionData.session.access_token}` },
+      });
+      const result = await response.json();
+      if (!response.ok || result.error) {
+        return { success: false, error: result.error || 'Impossible de vérifier le retrait MaishaPay.' };
+      }
+      if (!result.requestId || !['pending', 'processed', 'rejected'].includes(result.status)) {
+        return { success: false, error: 'Le serveur a retourné un état de retrait invalide.' };
+      }
+      const availableBalance = Number(result.availableBalance);
+      const lockedBalance = Number(result.lockedBalance);
+      if (!Number.isFinite(availableBalance) || !Number.isFinite(lockedBalance)) {
+        return { success: false, error: 'Le serveur a retourné un solde de retrait invalide.' };
+      }
+
+      return {
+        success: true,
+        data: {
+          requestId: result.requestId,
+          status: result.status,
+          availableBalance,
+          lockedBalance,
+          providerTransactionId: result.providerTransactionId,
+        },
+      };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Erreur de vérification du retrait.' };
     }
   },
 

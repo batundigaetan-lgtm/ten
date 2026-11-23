@@ -37,6 +37,7 @@ import {
   Unlock,
   AlertTriangle,
   RefreshCw,
+  Loader2,
   History,
   XCircle,
   Zap,
@@ -320,6 +321,7 @@ export default function App() {
     phone: '',
     referralCode: 'RT892X4',
     balance: 2000,
+    lockedBalance: 0,
     totalInvested: 0,
     totalEarned: 0,
     role: 'user' as 'user' | 'admin',
@@ -463,6 +465,7 @@ export default function App() {
             phone: profile.phone || '',
             referralCode: profile.referral_code || 'RT892X4',
             balance: Number(wallet?.balance || 0),
+            lockedBalance: Number(wallet?.locked_balance_cdf || 0),
             totalInvested: Number(wallet?.total_deposited || 0),
             totalEarned: Number(wallet?.total_earned || 0),
             role: profile.role || 'user'
@@ -475,22 +478,26 @@ export default function App() {
   const handleGateLoginSuccess = async (userData: { name: string; email: string; phone: string; role: 'user' | 'admin'; referralCode: string; balance?: number }) => {
     setIsLoggedIn(true);
 
-    let realBalance = userData.balance !== undefined ? userData.balance : 2000;
+    let userId = userData.role === 'admin' ? '999' : '1';
+    let realBalance = authService.isOnlineBackend() ? 0 : (userData.balance ?? 0);
+    let lockedBalance = 0;
     let realInvested = 0;
     let realEarned = 0;
     let isActivated = false;
-    let welcomeBonusClaimed = true;
+    let welcomeBonusClaimed = false;
 
     // Si Supabase est connecté, récupération immédiate des données réelles des tables 'wallets' et 'profiles'
     if (authService.isOnlineBackend()) {
       const session = await authService.getCurrentSession();
       if (session?.user) {
+        userId = session.user.id;
         const [wallet, profile] = await Promise.all([
           dataService.getWallet(session.user.id),
           dataService.getProfile(session.user.id),
         ]);
         if (wallet) {
           realBalance = Number(wallet.available_balance_cdf ?? wallet.balance ?? 0);
+          lockedBalance = Number(wallet.locked_balance_cdf || 0);
           realInvested = Number(wallet.total_deposited || 0);
           realEarned = Number(wallet.total_earned || 0);
         }
@@ -502,12 +509,13 @@ export default function App() {
     }
 
     setUser({
-      id: userData.role === 'admin' ? 999 : 1,
+      id: userId,
       fullName: userData.name,
       email: userData.email,
       phone: userData.phone,
       referralCode: userData.referralCode,
       balance: userData.role === 'admin' ? 0 : realBalance,
+      lockedBalance: userData.role === 'admin' ? 0 : lockedBalance,
       totalInvested: userData.role === 'admin' ? 0 : realInvested,
       totalEarned: userData.role === 'admin' ? 0 : realEarned,
       role: userData.role,
@@ -638,11 +646,31 @@ export default function App() {
     setActiveView('deposit');
   };
 
-  const [withdrawAmount, setWithdrawAmount] = useState<number>(5000);
-  const [withdrawPhone, setWithdrawPhone] = useState('+243976704762');
+  const withdrawalRequestStorageKey = `renttech_withdrawal_request_${user.id}`;
+  const [savedWithdrawalDraft] = useState<{ requestId: string; amount: number; phone: string } | null>(() => {
+    try {
+      const saved = localStorage.getItem(withdrawalRequestStorageKey);
+      if (!saved) return null;
+      const parsed = JSON.parse(saved);
+      if (
+        typeof parsed.requestId === 'string'
+        && Number.isSafeInteger(parsed.amount)
+        && typeof parsed.phone === 'string'
+      ) {
+        return parsed;
+      }
+    } catch (err) {
+      console.error('Erreur lors de la lecture de la demande de retrait sauvegardée:', err);
+    }
+    return null;
+  });
+  const [withdrawAmount, setWithdrawAmount] = useState<number>(savedWithdrawalDraft?.amount ?? 5000);
+  const [withdrawPhone, setWithdrawPhone] = useState(savedWithdrawalDraft?.phone ?? '+243976704762');
   const [withdrawSuccess, setWithdrawSuccess] = useState(false);
   const [withdrawError, setWithdrawError] = useState('');
   const [withdrawHash, setWithdrawHash] = useState('');
+  const [withdrawLoading, setWithdrawLoading] = useState(false);
+  const [withdrawRequestId, setWithdrawRequestId] = useState(savedWithdrawalDraft?.requestId ?? '');
 
   // Investissements Actifs (chargés exclusivement depuis Supabase ou vides par défaut)
   const [activeInvestments, setActiveInvestments] = useState<any[]>([]);
@@ -981,17 +1009,35 @@ export default function App() {
   };
 
   // SOUMISSION DÉPÔT & RECHARGE MOBILE MONEY AUTOMATIQUE (MAISHAPAY API PUSH)
-  const completeDepositSuccess = (txRef: string, amount: number, op: string) => {
+  const completeDepositSuccess = async (txRef: string, amount: number, op: string) => {
+    const session = await authService.getCurrentSession();
+    if (!session?.user || session.user.id !== String(user.id)) {
+      setDepositError('Le paiement est confirmé, mais la session utilisateur a changé. Reconnectez-vous pour actualiser le portefeuille.');
+      setDepositPushSent(false);
+      setDepositLoading(false);
+      return;
+    }
+
+    const [wallet, profile] = await Promise.all([
+      dataService.getWallet(session.user.id),
+      dataService.getProfile(session.user.id),
+    ]);
+    if (!wallet || !profile) {
+      setDepositError(`Le paiement est confirmé, mais le portefeuille n'a pas pu être rechargé. Gardez cette référence pour le support : ${txRef}`);
+      setDepositPushSent(false);
+      setDepositLoading(false);
+      return;
+    }
+
     const updatedUser = {
       ...user,
-      balance: user.balance + amount,
-      totalInvested: user.totalInvested + amount,
-      isActivated: true,
+      balance: Number(wallet.available_balance_cdf ?? wallet.balance ?? 0),
+      totalInvested: Number(wallet.total_deposited || 0),
+      totalEarned: Number(wallet.total_earned || 0),
+      isActivated: Boolean(profile.is_activated),
+      welcomeBonusClaimed: Boolean(profile.welcome_bonus_claimed),
     };
     setUser(updatedUser);
-    try {
-      localStorage.setItem('renttech_user_v2', JSON.stringify(updatedUser));
-    } catch (err) {}
 
     const newDeposit = {
       id: Date.now(),
@@ -1061,14 +1107,23 @@ export default function App() {
     setDepositPushSent(false);
 
     try {
+      const session = await authService.getCurrentSession();
+      if (!session?.access_token) {
+        setDepositError('Connectez-vous à votre compte Supabase pour effectuer un dépôt.');
+        setDepositLoading(false);
+        return;
+      }
+
       const res = await fetch('/api/maishapay/initiate-deposit', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session.access_token}`,
+        },
         body: JSON.stringify({
           amount: depositAmount,
           phone: depositPhone,
           operator: depositOperator,
-          userId: user.id || '1',
           customerName: user.fullName,
           customerEmail: user.email,
         }),
@@ -1081,13 +1136,18 @@ export default function App() {
         return;
       }
 
-      const txRef = data.reference || `DEP-${Date.now()}`;
+      const txRef = data.reference;
+      if (!txRef) {
+        setDepositError("Le serveur de paiement n'a pas fourni de référence de transaction.");
+        setDepositLoading(false);
+        return;
+      }
       setDepositTxRef(txRef);
       setDepositHash(txRef);
 
       // Si le dépôt est déjà complété (ex: Sandbox mode 0)
       if (data.status === 'completed') {
-        completeDepositSuccess(txRef, depositAmount, data.operator || depositOperator);
+        await completeDepositSuccess(txRef, depositAmount, data.operator || depositOperator);
         return;
       }
 
@@ -1100,11 +1160,26 @@ export default function App() {
       const pollTimer = setInterval(async () => {
         attempts++;
         try {
-          const chkRes = await fetch(`/api/maishapay/check-status/${txRef}`);
+          const currentSession = await authService.getCurrentSession();
+          if (!currentSession?.access_token) {
+            clearInterval(pollTimer);
+            setDepositPushSent(false);
+            setDepositError('Votre session a expiré. Reconnectez-vous pour vérifier le statut du paiement.');
+            return;
+          }
+          const chkRes = await fetch(`/api/maishapay/check-status/${txRef}`, {
+            headers: { Authorization: `Bearer ${currentSession.access_token}` },
+          });
           const chkData = await chkRes.json();
+          if (!chkRes.ok) {
+            clearInterval(pollTimer);
+            setDepositPushSent(false);
+            setDepositError(chkData.error || 'Impossible de vérifier le paiement auprès du serveur.');
+            return;
+          }
           if (chkData.status === 'completed') {
             clearInterval(pollTimer);
-            completeDepositSuccess(txRef, depositAmount, data.operator || depositOperator);
+            await completeDepositSuccess(txRef, depositAmount, data.operator || depositOperator);
           } else if (chkData.status === 'failed') {
             clearInterval(pollTimer);
             setDepositPushSent(false);
@@ -1160,74 +1235,105 @@ export default function App() {
       return;
     }
 
-    const txId = `TX-AIRTEL-W-${Math.floor(100000 + Math.random() * 900000)}`;
-    const hash = `SHA256: ${Array.from({length: 24}, () => Math.floor(Math.random()*16).toString(16)).join('')}`;
+    if (!authService.isOnlineBackend()) {
+      setWithdrawError('Le retrait est indisponible tant que le compte bancaire Supabase n’est pas connecté.');
+      return;
+    }
 
-    // Enregistrement dans la table Supabase withdrawal_requests si configuré
-    if (authService.isOnlineBackend()) {
+    const session = await authService.getCurrentSession();
+    if (!session?.user) {
+      setWithdrawError('Votre session a expiré. Reconnectez-vous avant de soumettre un retrait.');
+      return;
+    }
+
+    setWithdrawLoading(true);
+    try {
+      const requestId = withdrawRequestId || crypto.randomUUID();
+      setWithdrawRequestId(requestId);
+      try {
+        localStorage.setItem(withdrawalRequestStorageKey, JSON.stringify({
+          requestId,
+          amount: withdrawAmount,
+          phone: withdrawPhone,
+        }));
+      } catch (err) {
+        console.error('Erreur lors de la sauvegarde de la référence du retrait:', err);
+      }
+
       const res = await dataService.requestWithdrawal({
-        userId: String(user.id),
+        requestId,
         amount: withdrawAmount,
         destinationPhone: withdrawPhone,
         paymentMethod: 'airtel_money',
       });
 
-      if (!res.success) {
+      if (!res.success || !res.data) {
         setWithdrawError(res.error || 'Erreur lors de la validation du retrait.');
         return;
       }
+
+      let withdrawalData = res.data;
+      setUser(prev => ({
+        ...prev,
+        balance: withdrawalData.availableBalance,
+        lockedBalance: withdrawalData.lockedBalance,
+      }));
+
+      for (let attempt = 0; withdrawalData.status === 'pending' && attempt < 40; attempt += 1) {
+        await new Promise(resolve => window.setTimeout(resolve, 3000));
+        const statusResult = await dataService.getWithdrawalStatus(requestId);
+        if (statusResult.success && statusResult.data) {
+          withdrawalData = statusResult.data;
+          setUser(prev => ({
+            ...prev,
+            balance: withdrawalData.availableBalance,
+            lockedBalance: withdrawalData.lockedBalance,
+          }));
+        }
+      }
+
+      setWithdrawHash(withdrawalData.providerTransactionId || requestId);
+      if (withdrawalData.status === 'pending') {
+        setWithdrawError(`MaishaPay n'a pas encore fourni de résultat final. Le montant reste réservé et aucun nouveau transfert ne sera envoyé. Référence : ${requestId}`);
+        return;
+      }
+
+      try {
+        localStorage.removeItem(withdrawalRequestStorageKey);
+      } catch (err) {
+        console.error('Erreur lors de la suppression de la référence du retrait:', err);
+      }
+      setWithdrawRequestId('');
+
+      if (withdrawalData.status === 'rejected') {
+        setWithdrawError('MaishaPay a refusé le versement. Le montant réservé a été rendu à votre solde disponible.');
+        return;
+      }
+
+      const hash = withdrawalData.providerTransactionId || requestId;
+      setWithdrawSuccess(true);
+      setUserHistory(prev => [
+        {
+          id: requestId,
+          type: 'withdrawal',
+          title: `Retrait Airtel Money (${withdrawPhone})`,
+          amount: withdrawAmount,
+          status: 'approuve',
+          date: new Date().toISOString().replace('T', ' ').substring(0, 16),
+          hash,
+        },
+        ...prev,
+      ]);
+      setTicker(prev => [
+        { id: Date.now(), user: `${user.fullName.split(' ')[0]} K.`, action: 'a reçu un retrait Airtel Money', amount: `${withdrawAmount.toLocaleString('fr-FR')} FC`, time: 'à l\'instant', type: 'withdrawal' },
+        ...prev,
+      ]);
+      window.dispatchEvent(new Event('renttech_data_sync'));
+    } catch (err: any) {
+      setWithdrawError(err?.message || 'Erreur lors de la vérification du retrait MaishaPay.');
+    } finally {
+      setWithdrawLoading(false);
     }
-
-    // Déduire immédiatement le montant du solde disponible (verrouillage de sécurité)
-    setUser(prev => ({
-      ...prev,
-      balance: prev.balance - withdrawAmount
-    }));
-
-    // Mettre à jour également la balance sauvegardée dans localStorage
-    updateRegisteredUserAccount({ email: user.email, phone: user.phone, fullName: user.fullName }, -withdrawAmount, 0, 0);
-
-    const newWithdrawal = {
-      id: Date.now(),
-      txId,
-      userName: user.fullName,
-      email: user.email,
-      phone: withdrawPhone,
-      amount: withdrawAmount,
-      currentBalance: user.balance - withdrawAmount,
-      date: new Date().toISOString().replace('T', ' ').substring(0, 16),
-      hash
-    };
-
-    const updatedWithdrawals = [newWithdrawal, ...pendingWithdrawals];
-    setPendingWithdrawals(updatedWithdrawals);
-    try {
-      localStorage.setItem('renttech_pending_withdrawals_v2', JSON.stringify(updatedWithdrawals));
-    } catch (err) {
-      console.error('Erreur lors de la sauvegarde du retrait dans localStorage:', err);
-    }
-    window.dispatchEvent(new Event('renttech_data_sync'));
-
-    setUserHistory(prev => [
-      {
-        id: txId,
-        type: 'withdrawal',
-        title: `Retrait Airtel Money (${withdrawPhone})`,
-        amount: withdrawAmount,
-        status: 'en_attente',
-        date: new Date().toISOString().replace('T', ' ').substring(0, 16),
-        hash
-      },
-      ...prev
-    ]);
-
-    setTicker(prev => [
-      { id: Date.now(), user: `${user.fullName.split(' ')[0]} K.`, action: 'a demandé un retrait Airtel Money', amount: `${withdrawAmount.toLocaleString('fr-FR')} FC`, time: 'à l\'instant', type: 'withdrawal' },
-      ...prev
-    ]);
-
-    setWithdrawHash(hash);
-    setWithdrawSuccess(true);
   };
 
   // APPROBATION DEPOT ADMIN (+ COMMISSION PARRAIN 20%)
@@ -2436,6 +2542,13 @@ export default function App() {
                   <span className="text-emerald-400 font-mono font-bold">SHA-256 Encr. Validé</span>
                 </div>
 
+                {withdrawLoading && (
+                  <div className="p-4 bg-blue-500/10 border border-blue-500/30 rounded-2xl text-blue-300 text-xs font-semibold flex items-center gap-2">
+                    <Loader2 className="w-4 h-4 animate-spin shrink-0" />
+                    Transfert envoyé à MaishaPay. Vérification du résultat final avant confirmation...
+                  </div>
+                )}
+
                 {withdrawError && (
                   <div className="p-4 bg-rose-500/10 border border-rose-500/30 rounded-2xl text-rose-400 text-xs font-semibold flex items-center gap-2">
                     <AlertTriangle className="w-4 h-4 shrink-0" /> {withdrawError}
@@ -2447,16 +2560,16 @@ export default function App() {
                     <div className="w-16 h-16 bg-emerald-500/20 border border-emerald-500/40 rounded-full flex items-center justify-center mx-auto text-emerald-400 shadow-lg">
                       <CheckCircle2 className="w-10 h-10" />
                     </div>
-                    <h4 className="text-xl font-black text-emerald-400">Demande de Retrait Transmise !</h4>
+                    <h4 className="text-xl font-black text-emerald-400">Retrait confirmé par MaishaPay !</h4>
                     <p className="text-xs text-gray-300 max-w-md mx-auto">
-                      Votre demande de <span className="text-amber-400 font-bold font-mono">{withdrawAmount.toLocaleString('fr-FR')} FC</span> vers le <span className="text-white font-bold font-mono">{withdrawPhone}</span> a été enregistrée avec succès.
+                      MaishaPay confirme le versement de <span className="text-amber-400 font-bold font-mono">{withdrawAmount.toLocaleString('fr-FR')} FC</span> vers le <span className="text-white font-bold font-mono">{withdrawPhone}</span>.
                     </p>
 
                     <div className="p-4 bg-gray-900 rounded-2xl border border-gray-800 font-mono text-xs space-y-1 text-left max-w-md mx-auto">
-                      <span className="text-gray-500 block text-[10px]">JEU DE CLES CRYPTOGRAPHIQUES SIG:</span>
+                      <span className="text-gray-500 block text-[10px]">RÉFÉRENCE DE DEMANDE:</span>
                       <div className="text-blue-600 font-bold truncate">{withdrawHash}</div>
                       <div className="text-slate-700">Numéro Airtel Récepteur : {withdrawPhone}</div>
-                      <div className="text-emerald-600 font-bold">Statut : EN ATTENTE DE VERSEMENT MYATSI</div>
+                      <div className="text-emerald-600 font-bold">Statut : VERSEMENT CONFIRMÉ</div>
                     </div>
 
                     <button 
@@ -2476,8 +2589,14 @@ export default function App() {
                   const isExceedingBalance = withdrawAmount > withdrawableBalance;
                   const isBelowMinimum = withdrawAmount > 0 && withdrawAmount < 5000;
                   const isZeroOrNegative = withdrawAmount <= 0;
-                  const isPhoneInvalid = !withdrawPhone || withdrawPhone.replace(/\s+/g, '').length < 10;
-                  const isWithdrawalBlocked = isAccountPendingActivation || isExceedingBalance || isBelowMinimum || isZeroOrNegative || isPhoneInvalid || !isOnline;
+                  const rawPhoneDigits = withdrawPhone.replace(/\D/g, '');
+                  const localPhone = rawPhoneDigits.startsWith('243')
+                    ? `0${rawPhoneDigits.substring(3)}`
+                    : rawPhoneDigits.length === 9
+                    ? `0${rawPhoneDigits}`
+                    : rawPhoneDigits;
+                  const isPhoneInvalid = !/^09[789]\d{7}$/.test(localPhone);
+                  const isWithdrawalBlocked = isAccountPendingActivation || isExceedingBalance || isBelowMinimum || isZeroOrNegative || isPhoneInvalid || !isOnline || withdrawLoading;
 
                   return (
                     <form onSubmit={handleWithdrawSubmit} className="space-y-5">
@@ -2509,6 +2628,7 @@ export default function App() {
                         <div className="flex items-center justify-between text-[11px] text-gray-400 pt-2 border-t border-gray-800 flex-wrap gap-2">
                           <span>Bonus de bienvenue : <strong className="text-white font-mono">2 000 FC</strong> (réservé à l'investissement)</span>
                           <span>Solde retirable disponible : <strong className="text-emerald-400 font-mono">{withdrawableBalance.toLocaleString('fr-FR')} FC</strong></span>
+                          <span>Montant réservé : <strong className="text-amber-400 font-mono">{user.lockedBalance.toLocaleString('fr-FR')} FC</strong></span>
                         </div>
                       </div>
 
@@ -2643,8 +2763,10 @@ export default function App() {
                               ? "Retrait minimum de 5 000 FC requis"
                               : isExceedingBalance 
                               ? "Solde retirable insuffisant"
-                              : isPhoneInvalid 
-                              ? 'Veuillez saisir un N° Airtel (10 chiffres)'
+                              : isPhoneInvalid
+                              ? 'Veuillez saisir un numéro Airtel valide'
+                              : withdrawLoading
+                              ? 'Vérification MaishaPay en cours...'
                               : t.confirmWithdrawal}
                           </>
                         )}
