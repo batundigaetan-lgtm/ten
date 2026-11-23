@@ -155,6 +155,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         if (!$deposit) {
             throw new Exception("Dépôt introuvable ou déjà traité.");
         }
+        if (in_array($deposit['proof_image'], ['MAISHAPAY_AUTO', 'MAISHAPAY_PUSH'], true)) {
+            throw new Exception("Un dépôt MaishaPay doit être confirmé par l’API avant tout crédit.");
+        }
 
         $user_id = $deposit['user_id'];
         $amount = $deposit['amount'];
@@ -205,11 +208,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     verify_csrf_token($_POST['csrf_token'] ?? '');
     $deposit_id = intval($_POST['deposit_id']);
 
-    $stmt_rej = $pdo->prepare("UPDATE deposits SET status = 'rejete', processed_at = NOW() WHERE id = ? AND status = 'en_attente'");
-    if ($stmt_rej->execute([$deposit_id])) {
+    $stmt_rej = $pdo->prepare("UPDATE deposits SET status = 'rejete', processed_at = NOW() WHERE id = ? AND status = 'en_attente' AND proof_image NOT IN ('MAISHAPAY_AUTO', 'MAISHAPAY_PUSH')");
+    if ($stmt_rej->execute([$deposit_id]) && $stmt_rej->rowCount() > 0) {
         $message = "La demande de dépôt a été rejetée.";
     } else {
         $error = "Erreur lors du rejet du dépôt.";
+    }
+}
+
+// VÉRIFICATION EN DIRECT MAISHAPAY API
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'check_maishapay') {
+    verify_csrf_token($_POST['csrf_token'] ?? '');
+    require_once __DIR__ . '/maishapay.php';
+    $ref = sanitize($_POST['ref'] ?? '');
+    $res = maishapay_check_status($pdo, $ref);
+    if ($res['status'] === 'approuve') {
+        $message = "MaishaPay a confirmé le paiement ! Le portefeuille a été crédité et les commissions versées.";
+    } else {
+        $error = "Statut MaishaPay pour {$ref} : " . $res['message'];
     }
 }
 
@@ -398,22 +414,23 @@ $total_withdrawals = $pdo->query("SELECT SUM(amount) FROM withdrawals WHERE stat
 
     <!-- LISTE DES DÉPÔTS EN ATTENTE -->
     <div class="card card-custom p-4 mb-4">
-        <h5 class="text-gold fw-bold mb-3"><i class="bi bi-clock-history me-2"></i> Demandes de Dépôt / Recharge Airtel Money En Attente</h5>
+        <h5 class="text-gold fw-bold mb-3"><i class="bi bi-clock-history me-2"></i> Demandes de Dépôt / Recharge Mobile Money (MaishaPay)</h5>
         <div class="table-responsive">
             <table class="table table-dark table-striped align-middle">
                 <thead>
                     <tr>
                         <th>Investisseur</th>
                         <th>Pack / Description</th>
-                        <th>Montant envoyé</th>
-                        <th>Preuve de paiement</th>
+                        <th>Montant</th>
+                        <th>Opérateur & Réf</th>
+                        <th>Preuve / Type</th>
                         <th>Date</th>
                         <th>Actions</th>
                     </tr>
                 </thead>
                 <tbody>
                     <?php if (empty($pending_deposits)): ?>
-                        <tr><td colspan="6" class="text-center text-muted py-4">Aucune demande de dépôt en attente.</td></tr>
+                        <tr><td colspan="7" class="text-center text-muted py-4">Aucune demande de dépôt en attente.</td></tr>
                     <?php else: ?>
                         <?php foreach ($pending_deposits as $dep): ?>
                             <tr>
@@ -421,29 +438,62 @@ $total_withdrawals = $pdo->query("SELECT SUM(amount) FROM withdrawals WHERE stat
                                     <div class="fw-bold"><?= htmlspecialchars($dep['full_name']) ?></div>
                                     <small class="text-muted"><?= htmlspecialchars($dep['phone']) ?></small>
                                 </td>
-                                <td><?= htmlspecialchars($dep['level_name']) ?></td>
+                                <td><?= htmlspecialchars($dep['level_name'] ?? 'Recharge') ?></td>
                                 <td class="fw-bold text-gold fs-5"><?= number_format($dep['amount'], 0, ',', ' ') ?> FC</td>
                                 <td>
-                                    <a href="uploads/<?= htmlspecialchars($dep['proof_image']) ?>" target="_blank">
-                                        <img src="uploads/<?= htmlspecialchars($dep['proof_image']) ?>" class="proof-thumbnail" alt="Preuve">
-                                    </a>
+                                    <?php 
+                                    $op = strtoupper($dep['operator'] ?? 'AIRTEL');
+                                    if ($op === 'AIRTEL'): ?>
+                                        <span class="badge bg-danger">Airtel</span>
+                                    <?php elseif ($op === 'MPESA'): ?>
+                                        <span class="badge bg-primary">M-Pesa</span>
+                                    <?php elseif ($op === 'ORANGE'): ?>
+                                        <span class="badge bg-warning text-dark">Orange</span>
+                                    <?php else: ?>
+                                        <span class="badge bg-secondary"><?= htmlspecialchars($op) ?></span>
+                                    <?php endif; ?>
+                                    <div class="mt-1"><code class="text-info small"><?= htmlspecialchars($dep['transaction_ref'] ?? '') ?></code></div>
+                                </td>
+                                <td>
+                                    <?php if (!empty($dep['proof_image']) && !in_array($dep['proof_image'], ['MAISHAPAY_AUTO', 'MAISHAPAY_PUSH'])): ?>
+                                        <a href="uploads/<?= htmlspecialchars($dep['proof_image']) ?>" target="_blank">
+                                            <img src="uploads/<?= htmlspecialchars($dep['proof_image']) ?>" class="proof-thumbnail" alt="Preuve">
+                                        </a>
+                                    <?php else: ?>
+                                        <span class="badge bg-info text-dark"><i class="bi bi-phone-vibrate me-1"></i> Push MaishaPay</span>
+                                    <?php endif; ?>
                                 </td>
                                 <td><?= date('d/m/Y H:i', strtotime($dep['created_at'])) ?></td>
                                 <td>
-                                    <div class="d-flex gap-2">
-                                        <form action="admin.php" method="POST" onsubmit="return confirm('Voulez-vous vraiment approuver ce dépôt et verser les commissions ?');">
-                                            <input type="hidden" name="action" value="approve_deposit">
-                                            <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
-                                            <input type="hidden" name="deposit_id" value="<?= $dep['id'] ?>">
-                                            <button type="submit" class="btn btn-success btn-sm fw-bold"><i class="bi bi-check-lg me-1"></i> Approuver et Verser</button>
-                                        </form>
+                                    <div class="d-flex flex-wrap gap-2">
+                                        <?php if (!empty($dep['transaction_ref'])): ?>
+                                            <form action="admin.php" method="POST">
+                                                <input type="hidden" name="action" value="check_maishapay">
+                                                <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
+                                                <input type="hidden" name="ref" value="<?= htmlspecialchars($dep['transaction_ref']) ?>">
+                                                <button type="submit" class="btn btn-outline-info btn-sm fw-bold"><i class="bi bi-arrow-repeat me-1"></i> Vérifier API</button>
+                                            </form>
+                                        <?php endif; ?>
 
-                                        <form action="admin.php" method="POST" onsubmit="return confirm('Rejeter ce dépôt ?');">
-                                            <input type="hidden" name="action" value="reject_deposit">
-                                            <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
-                                            <input type="hidden" name="deposit_id" value="<?= $dep['id'] ?>">
-                                            <button type="submit" class="btn btn-danger btn-sm"><i class="bi bi-x-lg me-1"></i> Rejeter</button>
-                                        </form>
+                                        <?php if (!in_array($dep['proof_image'], ['MAISHAPAY_AUTO', 'MAISHAPAY_PUSH'], true)): ?>
+                                            <?php if (!in_array($dep['proof_image'], ['MAISHAPAY_AUTO', 'MAISHAPAY_PUSH'], true)): ?>
+                                                <form action="admin.php" method="POST" onsubmit="return confirm('Voulez-vous vraiment approuver ce dépôt et verser les commissions ?');">
+                                                    <input type="hidden" name="action" value="approve_deposit">
+                                                    <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
+                                                    <input type="hidden" name="deposit_id" value="<?= $dep['id'] ?>">
+                                                    <button type="submit" class="btn btn-success btn-sm fw-bold"><i class="bi bi-check-lg me-1"></i> Approuver</button>
+                                                </form>
+                                            <?php endif; ?>
+                                        <?php endif; ?>
+
+                                        <?php if (!in_array($dep['proof_image'], ['MAISHAPAY_AUTO', 'MAISHAPAY_PUSH'], true)): ?>
+                                            <form action="admin.php" method="POST" onsubmit="return confirm('Rejeter ce dépôt ?');">
+                                                <input type="hidden" name="action" value="reject_deposit">
+                                                <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
+                                                <input type="hidden" name="deposit_id" value="<?= $dep['id'] ?>">
+                                                <button type="submit" class="btn btn-danger btn-sm"><i class="bi bi-x-lg me-1"></i> Rejeter</button>
+                                            </form>
+                                        <?php endif; ?>
                                     </div>
                                 </td>
                             </tr>

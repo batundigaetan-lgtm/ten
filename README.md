@@ -18,3 +18,11 @@ View your app in AI Studio: https://ai.studio/apps/00dd5115-89ac-4171-8299-030b8
 2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
 3. Run the app:
    `npm run dev`
+
+## MaishaPay Mobile Money
+
+- The React/Node payment endpoint is a local demo only. It simulates a payment in development and refuses real transactions; demo balances are stored only in the browser.
+- Real payments are handled by the PHP/MySQL flow (`dashboard.php`, `api_deposit.php`, and `maishapay_callback.php`). The server requires PHP with PDO MySQL and cURL, and the schema from `database.sql`.
+- Configure `.env` on the PHP host with the merchant keys, `MAISHAPAY_MODE=1`, and `APP_URL` set to the public HTTPS base URL that serves the PHP callback. The values in `.env.example` are placeholders.
+- `MAISHAPAY_MODE=0` is a no-payment sandbox: it does not call MaishaPay or credit a persistent wallet.
+- Do not commit `.env` or expose merchant keys in client-side code.

@@ -17,18 +17,39 @@ if (session_status() === PHP_SESSION_NONE) {
     session_start();
 }
 
-define('DB_HOST', 'localhost');
-define('DB_NAME', 'renttech_hub');
-define('DB_USER', 'root');
-define('DB_PASS', '');
-define('DB_CHARSET', 'utf8mb4');
+// Chargement automatique et sécurisé du fichier .env
+(function() {
+    $envFile = __DIR__ . '/.env';
+    if (!file_exists($envFile)) return;
+    $lines = file($envFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    foreach ($lines as $line) {
+        $line = trim($line);
+        if ($line === '' || strpos($line, '#') === 0) continue;
+        if (strpos($line, '=') !== false) {
+            list($name, $val) = explode('=', $line, 2);
+            $name = trim($name);
+            $val = trim($val, " \t\n\r\0\x0B\"'");
+            if (getenv($name) === false) {
+                putenv("$name=$val");
+                $_ENV[$name] = $val;
+                $_SERVER[$name] = $val;
+            }
+        }
+    }
+})();
 
-define('AIRTEL_OFFICIAL_NUMBER', '0992611845');
-define('AIRTEL_OFFICIAL_NAME', 'KAMBALE');
-define('REFERRAL_COMMISSION_PERCENT', 20);
+define('DB_HOST', getenv('DB_HOST') ?: 'localhost');
+define('DB_NAME', getenv('DB_NAME') ?: 'renttech_hub');
+define('DB_USER', getenv('DB_USER') ?: 'root');
+define('DB_PASS', getenv('DB_PASS') !== false ? getenv('DB_PASS') : '');
+define('DB_CHARSET', getenv('DB_CHARSET') ?: 'utf8mb4');
+
+define('AIRTEL_OFFICIAL_NUMBER', getenv('AIRTEL_OFFICIAL_NUMBER') ?: '0992611845');
+define('AIRTEL_OFFICIAL_NAME', getenv('AIRTEL_OFFICIAL_NAME') ?: 'KAMBALE');
+define('REFERRAL_COMMISSION_PERCENT', (int)(getenv('REFERRAL_COMMISSION_PERCENT') ?: 20));
 
 // CODE DE SÉCURITÉ PIN ADMIN ULTRA SÉCURISÉ (6 Chiffres)
-define('ADMIN_SECURITY_PIN', '998844');
+define('ADMIN_SECURITY_PIN', getenv('ADMIN_SECURITY_PIN') ?: '998844');
 define('MAX_LOGIN_ATTEMPTS', 5);
 define('LOGIN_LOCKOUT_TIME', 900); // 15 minutes d'attente après 5 échecs
 
